@@ -114,6 +114,9 @@ class VectorFittingTestCase(unittest.TestCase):
 
     @pytest.mark.skipif("matplotlib" in sys.modules, reason="Raise Error only if matplotlib is not installed.")
     def test_matplotlib_missing(self):
+        import matplotlib
+        matplotlib.use('agg')
+        
         vf = skrf.vectorFitting.VectorFitting(skrf.data.ring_slot)
         with self.assertRaises(RuntimeError):
             vf.plot_convergence()
