@@ -32,11 +32,13 @@ import typing
 import warnings
 import zipfile
 from dataclasses import dataclass, field
-from typing import Callable
+from functools import cached_property
+from pathlib import Path
+from typing import Callable, Literal
 
-import numpy as npy
+import numpy as np
 
-from ..constants import FREQ_UNITS, S_DEF_HFSS_DEFAULT
+from ..constants import FREQ_UNITS, S_DEF_HFSS_DEFAULT, S_DEFINITIONS, SparamFormatT
 from ..media import DefinedGammaZ0
 from ..network import Network
 from ..util import get_fid
@@ -90,7 +92,7 @@ class ParserState:
 
         return self.rank * 2
 
-    @property
+    @cached_property
     def numbers_per_line(self) -> int:
         """Returns data points per frequency point.
 
@@ -99,7 +101,7 @@ class ParserState:
         """
         if self.matrix_format == "full":
             return self.rank**2 * 2
-        return self.rank**2 * self.rank
+        return self.rank*(self.rank+1)
 
     @property
     def parse_noise(self) -> bool:
@@ -165,7 +167,7 @@ class ParserState:
             err_msg = f"ERROR: illegal frequency_unit {self.frequency_unit}\n"
         if self.parameter not in "syzgh":
             err_msg = f"ERROR: illegal parameter value {self.parameter}\n"
-        if self.format not in ["ma", "db", "ri"]:
+        if self.format not in typing.get_args(SparamFormatT):
             err_msg = f"ERROR: illegal format value {self.format}\n"
 
         if err_msg:
@@ -188,13 +190,13 @@ class Touchstone:
     .. [#] https://ibis.org/touchstone_ver2.0/touchstone_ver2_0.pdf
     """
 
-    def __init__(self, file: str | typing.TextIO, encoding: str | None = None):
+    def __init__(self, file: str | Path | typing.TextIO, encoding: str | None = None):
         """
         constructor
 
         Parameters
         ----------
-        file : str or file-object
+        file : str, Path, or file-object
             touchstone file to load
         encoding : str, optional
             define the file encoding to use. Default value is None,
@@ -257,7 +259,7 @@ class Touchstone:
         self.gamma = None
         self.z0 = None
         self.s_def = None
-        self.port_modes = None
+        self.port_modes = np.array([])
 
         # open the file depending on encoding
         # Guessing the encoding by trial-and-error, unless specified encoding
@@ -370,7 +372,7 @@ class Touchstone:
         # Should be .sNp for Touchstone format V1.0, and .ts for V2
         extension = self.filename.split(".")[-1].lower()
 
-        m = re.match(r"s(\d+)p", extension)
+        m = re.match(r"[ghsyz](\d+)p", extension)
         if m:
             state.rank = int(m.group(1))
         elif extension != "ts":
@@ -428,12 +430,19 @@ class Touchstone:
 
             line_l = line.lower()
 
-            for k, v in self._parse_dict.items():
-                if line_l.startswith(k):
-                    v(line)
-                    break
-            else:
-                values = [float(v) for v in line.partition("!")[0].split()]
+            is_data_line = True
+            # Avoid traversing the self._parse_dict for each line by checking the first letter
+            # {"!", "#", "["} covers all the first letters of the key of the current self._parse_dict
+            if line_l[0] in {"!", "#", "["}:
+                for k, v in self._parse_dict.items():
+                    if line_l.startswith(k):
+                        v(line)
+                        is_data_line = False
+                        break
+            if is_data_line:
+                if "!" in line:
+                    line = line.partition("!")[0]
+                values = list(map(float, line.split()))
                 if not values:
                     continue
 
@@ -482,7 +491,7 @@ class Touchstone:
                 self.port_names[k] = v
 
         if state.hfss_gamma:
-            self.gamma = npy.array(state.hfss_gamma).view(npy.complex128)
+            self.gamma = np.array(state.hfss_gamma).view(np.complex128)
 
 
         # Impedance is parsed in the following order:
@@ -490,53 +499,61 @@ class Touchstone:
         # - TS v2 Reference keyword for each port.
         # - Reference impedance from option line.
         if state.hfss_impedance:
-            self.z0 = npy.array(state.hfss_impedance).view(npy.complex128)
+            self.z0 = np.array(state.hfss_impedance).view(np.complex128)
             # Comment the line in, when we need when to expect port impedances in NxN format.
             # See https://github.com/scikit-rf/scikit-rf/issues/354 for details.
             #if state.ansys_data_type == "terminal":
-            #    self.z0 = npy.diagonal(self.z0.reshape(-1, self.rank, self.rank), axis1=1, axis2=2)
+            #    self.z0 = np.diagonal(self.z0.reshape(-1, self.rank, self.rank), axis1=1, axis2=2)
 
             self.s_def = S_DEF_HFSS_DEFAULT
             self.has_hfss_port_impedances = True
+            # Load the reference impedance convention from the comments
+            for s_def in S_DEFINITIONS:
+                if f'S-parameter uses the {s_def} definition' in self.comments:
+                    self.s_def = s_def
         elif self.reference is None:
-            self.z0 = npy.broadcast_to(self.resistance, (len(state.f), state.rank)).copy()
+            self.z0 = np.broadcast_to(self.resistance, (len(state.f), state.rank)).copy()
         else:
-            self.z0 = npy.empty((len(state.f), state.rank), dtype=complex).fill(self.reference)
+            self.z0 = np.empty((len(state.f), state.rank), dtype=complex).fill(self.reference)
 
-        self.f = npy.array(state.f)
+        self.f = np.array(state.f)
         if not len(self.f):
-            self.s = npy.empty((0, state.rank, state.rank))
+            self.s = np.empty((0, state.rank, state.rank))
             return
 
-        raw = npy.array(state.s).reshape(len(self.f), -1)
+        raw = np.array(state.s).reshape(len(self.f), -1)
 
         if self.format == "db":
             raw[:, 0::2] = 10 ** (raw[:, 0::2] / 20.0)
 
         if self.format in (["ma", "db"]):
-            s_flat = raw[:, 0::2] * npy.exp(1j * raw[:, 1::2] * npy.pi / 180)
+            s_flat = raw[:, 0::2] * np.exp(1j * raw[:, 1::2] * np.pi / 180)
         elif self.format == "ri":
-            s_flat = raw.view(npy.complex128)
+            s_flat = raw.view(np.complex128)
 
         self.s_flat = s_flat
 
-        self.s = npy.empty((len(self.f), state.rank * state.rank), dtype=complex)
+        self.s = np.empty((len(self.f), state.rank * state.rank), dtype=complex)
         if state.matrix_format == "full":
             self.s[:] = s_flat
         else:
-            index = npy.tril_indices(state.rank) if state.matrix_format == "lower" else npy.triu_indices(self.rank)
-            index_flat = npy.ravel_multi_index(index, (state.rank, state.rank))
+            index = np.tril_indices(state.rank) if state.matrix_format == "lower" else np.triu_indices(state.rank)
+            index_flat = np.ravel_multi_index(index, (state.rank, state.rank))
             self.s[:, index_flat] = s_flat
 
         if state.rank == 2 and state.two_port_order_legacy:
-            self.s = npy.transpose(self.s.reshape((-1, state.rank, state.rank)), axes=(0, 2, 1))
+            self.s = np.transpose(self.s.reshape((-1, state.rank, state.rank)), axes=(0, 2, 1))
         else:
             self.s = self.s.reshape((-1, state.rank, state.rank))
 
-        if state.matrix_format != "full":
-            self.s = npy.nanmax((self.s, self.s.transpose(0, 2, 1)), axis=0)
+        if state.matrix_format == "upper":
+            index_lower = np.tril_indices(state.rank)
+            self.s[(...,*index_lower)] = self.s.transpose(0, 2, 1)[(...,*index_lower)]
+        elif state.matrix_format == "lower":
+            index_upper = np.triu_indices(state.rank)
+            self.s[(...,*index_upper)] = self.s.transpose(0, 2, 1)[(...,*index_upper)]
 
-        self.port_modes = npy.array(["S"] * state.rank)
+        self.port_modes = np.array(["S"] * state.rank)
         if state.mixed_mode_order:
             new_order = [None] * state.rank
             for i, mm in enumerate(state.mixed_mode_order):
@@ -551,7 +568,7 @@ class Touchstone:
                         new_order[i] = p2
                 self.port_modes[new_order[i]] = mm[0].upper()
 
-            order = npy.arange(self.rank, dtype=int)
+            order = np.arange(self.rank, dtype=int)
             self.s[:, new_order, :] = self.s[:, order, :]
             self.s[:, :, new_order] = self.s[:, :, order]
             self.z0[:, self.port_modes == "D"] *= 2
@@ -563,27 +580,27 @@ class Touchstone:
 
             func_name = f"{self.parameter}2s"
             from .. import network
-            self.s: npy.ndarray = getattr(network, func_name)(self.s, self.z0)
+            self.s: np.ndarray = getattr(network, func_name)(self.s, self.z0)
 
 
         # multiplier from the frequency unit
         self.frequency_mult = state.frequency_mult
 
         if state.noise:
-            self.noise = npy.array(state.noise)
+            self.noise = np.array(state.noise)
             self.noise[:, 0] *= self.frequency_mult
 
         self.f *= self.frequency_mult
 
     @property
-    def sparameters(self) -> npy.ndarray:
+    def sparameters(self) -> np.ndarray:
         """Touchstone data in tabular format.
 
         Returns:
-            npy.ndarray: Frequency and data array.
+            np.ndarray: Frequency and data array.
         """
         warnings.warn("This method is deprecated and will be removed.", DeprecationWarning, stacklevel=2)
-        return npy.hstack((self.f[:, None], self.s_flat.view(npy.float64).reshape(len(self.f), -1)))
+        return np.hstack((self.f[:, None], self.s_flat.view(np.float64).reshape(len(self.f), -1)))
 
     def get_comments(self, ignored_comments: list[str]=None) -> str:
         """
@@ -633,7 +650,7 @@ class Touchstone:
                 pass
         return var_dict
 
-    def get_format(self, format="ri") -> str:
+    def get_format(self, format: Literal[SparamFormatT, Literal["orig"]]="ri") -> str:
         """
         Returns the file format string used for the given format.
 
@@ -649,9 +666,9 @@ class Touchstone:
             format = self.format
         else:
             frequency = "hz"
-        return f"{frequency} {self.parameter} {format} r {self.resistance}"
+        return f"{frequency} {self.parameter} {format.upper()} r {self.resistance}"
 
-    def get_sparameter_names(self, format: str="ri") -> list[str]:
+    def get_sparameter_names(self, format: SparamFormatT = "ri") -> list[str]:
         """
         Generate a list of column names for the s-parameter data.
         The names are different for each format.
@@ -670,7 +687,7 @@ class Touchstone:
         warnings.warn("This method is deprecated and will be removed.", DeprecationWarning, stacklevel=2)
         return self.get_sparameter_data(format).keys()
 
-    def get_sparameter_data(self, format: str="ri") -> dict[str, npy.ndarray]:
+    def get_sparameter_data(self, format: SparamFormatT = "ri") -> dict[str, np.ndarray]:
         """
         Get the data of the s-parameter with the given format.
 
@@ -704,15 +721,15 @@ class Touchstone:
                     ret[f"{prefix}R"] = val.real
                     ret[f"{prefix}I"] = val.imag
                 elif format == "ma":
-                    ret[f"{prefix}M"] = npy.abs(val)
-                    ret[f"{prefix}A"] = npy.angle(val, deg=True)
+                    ret[f"{prefix}M"] = np.abs(val)
+                    ret[f"{prefix}A"] = np.angle(val, deg=True)
                 elif format == "db":
-                    ret[f"{prefix}DB"] = 20 * npy.log10(npy.abs(val))
-                    ret[f"{prefix}A"] = npy.angle(val, deg=True)
+                    ret[f"{prefix}DB"] = 20 * np.log10(np.abs(val))
+                    ret[f"{prefix}A"] = np.angle(val, deg=True)
 
         return ret
 
-    def get_sparameter_arrays(self) -> tuple[npy.ndarray, npy.ndarray]:
+    def get_sparameter_arrays(self) -> tuple[np.ndarray, np.ndarray]:
         """
         Returns the s-parameters as a tuple of arrays.
 
@@ -749,15 +766,15 @@ class Touchstone:
 
         Returns
         -------
-        gamma : complex npy.ndarray
+        gamma : complex np.ndarray
             complex  propagation constant
-        z0 : npy.ndarray
+        z0 : np.ndarray
             complex port impedance
         """
         return self.gamma, self.z0
 
 
-def hfss_touchstone_2_gamma_z0(filename: str) -> tuple[npy.ndarray, npy.ndarray, npy.ndarray]:
+def hfss_touchstone_2_gamma_z0(filename: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Extracts Z0 and Gamma comments from touchstone file.
 
@@ -772,11 +789,11 @@ def hfss_touchstone_2_gamma_z0(filename: str) -> tuple[npy.ndarray, npy.ndarray,
 
     Returns
     -------
-    f : npy.ndarray
+    f : np.ndarray
         frequency vector (in Hz)
-    gamma : complex npy.ndarray
+    gamma : complex np.ndarray
         complex  propagation constant
-    z0 : npy.ndarray
+    z0 : np.ndarray
         complex port impedance
 
     Examples
@@ -871,7 +888,7 @@ def read_zipped_touchstones(ziparchive: zipfile.ZipFile, dir: str = "") -> dict[
     networks = dict()
     for fname in ziparchive.namelist():  # type: str
         directory = os.path.split(fname)[0]
-        if dir == directory and  re.match(r"s\d+p", fname.lower()):
+        if dir == directory and  re.search(r"s\d+p$", fname.lower()):
             network = Network.zipped_touchstone(fname, ziparchive)
             networks[network.name] = network
     return networks

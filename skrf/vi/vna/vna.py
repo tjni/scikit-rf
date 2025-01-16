@@ -6,6 +6,7 @@ vna (:mod:`skrf.vi.vna.vna`)
 
 Provides the VNA base class
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -16,7 +17,6 @@ if TYPE_CHECKING:
 import functools
 import inspect
 import re
-from abc import ABC
 from enum import Enum, auto
 
 import numpy as np
@@ -63,9 +63,7 @@ class Channel:
         This class should not be instantiated directly
     """
 
-    def __init__(
-        self, parent, cnum: int | None = None, cname: str | None = None
-    ) -> None:
+    def __init__(self, parent, cnum: int | None = None, cname: str | None = None) -> None:
         self.parent = parent
         self.cnum = cnum
         self.name = cname
@@ -78,12 +76,10 @@ class Channel:
         self.query_values = self.parent.query_values
 
 
-class VNA(ABC):
+class VNA:
     _scpi = True  # Set to false in subclasses that don't use SCPI
 
-    def __init__(
-        self, address: str, backend: str = "@py", timeout: int | None = None
-    ) -> None:
+    def __init__(self, address: str, backend: str = "@py", timeout: int | None = None) -> None:
         rm = pyvisa.ResourceManager(backend)
         self._resource = rm.open_resource(address, timeout=timeout)
 
@@ -125,7 +121,7 @@ class VNA(ABC):
         def __getattr__(self, k):
             if not hasattr(self.Channel, k):
                 raise AttributeError(f"{type(self).__name__} has no attribute {k}")
-            return getattr(self.ch1, k)
+            return getattr(self.active_channel, k)
 
         cls.create_channel = create_channel
         cls.delete_channel = delete_channel
@@ -204,9 +200,7 @@ class VNA(ABC):
 
             cmd = _format_cmd(get_cmd, self=self)
             if values:
-                arg = self.query_values(
-                    cmd, container=values_container, complex_values=complex_values
-                )
+                arg = self.query_values(cmd, container=values_container, complex_values=complex_values)
             else:
                 arg = self.query(cmd)
 

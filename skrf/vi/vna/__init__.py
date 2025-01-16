@@ -18,7 +18,8 @@ VNA Classes
    hp.HP8510C
    keysight.FieldFox
    keysight.PNA
-   nanovna.NanoVNA
+   nanovna.NanoVNAv2
+   rohde_schwarz.ZVA
 
 The Base Class and Writing an Instrument Driver
 ===============================================
@@ -176,5 +177,6 @@ Here's an example of using a validator:
     # example, the string '100000' to the int 100_000
     _ = instr.ch1.freq_start
 """
-from .vna import VNA, Channel, ValuesFormat # isort: skip
-from . import keysight, nanovna # isort: skip
+
+from .vna import VNA, Channel, ValuesFormat  # isort: skip
+from . import keysight, nanovna, rohde_schwarz  # isort: skip

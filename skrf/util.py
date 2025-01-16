@@ -62,10 +62,11 @@ import sys
 import warnings
 from datetime import datetime
 from functools import wraps
+from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Any, Callable, Iterable, TypeVar
 
-import numpy as npy
+import numpy as np
 
 from .constants import Number
 
@@ -117,8 +118,22 @@ def copy_doc(copy_func: Callable) -> Callable:
         return func
     return wrapper
 
+def figure(*args, **kwargs) -> Figure:
+    """
+    Wraps the matplotlib figure call and raises if not available.
 
-def subplots(*args, **kwargs) -> tuple[Figure, npy.ndarray]:
+    Raises
+    ------
+    RuntimeError
+        When trying to get subplots without matplotlib installed.
+    """
+
+    try:
+        return plt.figure(*args, **kwargs)
+    except NameError as err:
+        raise RuntimeError("Plotting is not available") from err
+
+def subplots(*args, **kwargs) -> tuple[Figure, np.ndarray]:
     """
     Wraps the matplotlib subplots call and raises if not available.
 
@@ -176,13 +191,13 @@ def now_string_2_dt(s: str) -> datetime:
     return datetime(*[int(k) for k in s.split('.')])
 
 
-def find_nearest(array: npy.ndarray, value: Number) -> Number:
+def find_nearest(array: np.ndarray, value: Number) -> Number:
     """
     Find the nearest value in array.
 
     Parameters
     ----------
-    array :  npy.ndarray
+    array :  np.ndarray
         array we are searching for a value in
     value : element of the array
         value to search for
@@ -197,13 +212,13 @@ def find_nearest(array: npy.ndarray, value: Number) -> Number:
     return array[idx]
 
 
-def find_nearest_index(array: npy.ndarray, value: Number) -> int:
+def find_nearest_index(array: np.ndarray, value: Number) -> int:
     """
     Find the nearest index for a value in array.
 
     Parameters
     ----------
-    array :  npy.ndarray
+    array :  np.ndarray
         array we are searching for a value in
     value : element of the array
         value to search for
@@ -219,10 +234,10 @@ def find_nearest_index(array: npy.ndarray, value: Number) -> int:
     taken from  http://stackoverflow.com/questions/2566412/find-nearest-value-in-numpy-array
 
     """
-    return (npy.abs(array-value)).argmin()
+    return (np.abs(array-value)).argmin()
 
 
-def slice_domain(x: npy.ndarray, domain: tuple):
+def slice_domain(x: np.ndarray, domain: tuple):
     """
     Returns a slice object closest to the `domain` of `x`
 
@@ -230,7 +245,7 @@ def slice_domain(x: npy.ndarray, domain: tuple):
 
     Parameters
     ----------
-    vector : npy.ndarray
+    vector : np.ndarray
         an array of values
     domain : tuple
         tuple of (start,stop) values defining the domain over
@@ -259,7 +274,7 @@ def get_fid(file, *args, **kwargs):
 
     Parameters
     ----------
-    file : str/unicode or file-object
+    file : str/unicode, Path, or file-object
         file to open
     \*args, \*\*kwargs : arguments and keyword arguments to `open()`
 
@@ -268,13 +283,13 @@ def get_fid(file, *args, **kwargs):
     fid : file object
 
     """
-    if isinstance(file, str):
+    if isinstance(file, (str, Path)):
         return open(file, *args, **kwargs)
     else:
         return file
 
 
-def get_extn(filename: str) -> str:
+def get_extn(filename: str | Path) -> str:
     """
     Get the extension from a filename.
 
@@ -283,7 +298,7 @@ def get_extn(filename: str) -> str:
 
     Parameters
     ----------
-    filename : string
+    filename : string or Path
         the filename
 
     Returns
@@ -293,6 +308,10 @@ def get_extn(filename: str) -> str:
         isn't one
 
     """
+
+    if isinstance(filename, Path):
+        return filename.suffix.strip('.') or None
+
     ext = os.path.splitext(filename)[-1]
     if len(ext) == 0:
         return None
@@ -349,7 +368,7 @@ def git_version(modname: str) -> str:
     return out
 
 
-def dict_2_recarray(d: dict, delim: str, dtype: list[tuple]) -> npy.ndarray:
+def dict_2_recarray(d: dict, delim: str, dtype: list[tuple]) -> np.ndarray:
     """
     Turn a dictionary of structured keys to a record array of objects.
 
@@ -394,7 +413,7 @@ def dict_2_recarray(d: dict, delim: str, dtype: list[tuple]) -> npy.ndarray:
     """
 
     split_keys = [tuple(k.split(delim)+[d[k]]) for k in d.keys()]
-    x = npy.array(split_keys, dtype=dtype+[('values',object)])
+    x = np.array(split_keys, dtype=dtype+[('values',object)])
     return x
 
 
@@ -736,7 +755,7 @@ def unique_name(name: str, names: list, exclude: int = -1) -> str:
     return name
 
 
-def smooth(x: npy.ndarray, window_len: int = 11, window: str = 'flat') -> npy.ndarray:
+def smooth(x: np.ndarray, window_len: int = 11, window: str = 'flat') -> np.ndarray:
     """
     Smooth the data using a window with requested size.
 
@@ -797,12 +816,12 @@ def smooth(x: npy.ndarray, window_len: int = 11, window: str = 'flat') -> npy.nd
     if window not in ['flat', 'hanning', 'hamming', 'bartlett', 'blackman']:
         raise ValueError("Window is one of 'flat', 'hanning', 'hamming', 'bartlett', 'blackman'")
 
-    s = npy.r_[x[window_len - 1:0:-1], x, x[-2:-window_len - 1:-1]]
+    s = np.r_[x[window_len - 1:0:-1], x, x[-2:-window_len - 1:-1]]
     if window == 'flat':  # moving average
-        w = npy.ones(window_len, 'd')
+        w = np.ones(window_len, 'd')
     else:
-        w = eval('npy.' + window + '(window_len)')
-    y = npy.convolve(w / w.sum(), s, mode='same')
+        w = eval('np.' + window + '(window_len)')
+    y = np.convolve(w / w.sum(), s, mode='same')
     return y[window_len-1:-(window_len-1)]
 
 
@@ -873,9 +892,9 @@ class ProgressBar:
 
 @contextlib.contextmanager
 def suppress_numpy_warnings(**kw):
-    olderr = npy.seterr(**kw)
+    olderr = np.seterr(**kw)
     yield
-    npy.seterr(**olderr)
+    np.seterr(**olderr)
 
 
 def suppress_warning_decorator(msg):

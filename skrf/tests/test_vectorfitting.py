@@ -73,27 +73,6 @@ class VectorFittingTestCase(unittest.TestCase):
         # quality of the fit is not important in this test; it only needs to finish
         self.assertLess(vf.get_rms_error(), 0.2)
 
-    @pytest.mark.skipif(
-        "matplotlib" not in sys.modules,
-        reason="Spice subcircuit uses Engformatter which is not available without matplotlib.")
-    def test_spice_subcircuit(self):
-        # fit ring slot example network
-        nw = skrf.data.ring_slot
-        vf = skrf.vectorFitting.VectorFitting(nw)
-        vf.vector_fit(n_poles_real=4, n_poles_cmplx=0, fit_constant=True, fit_proportional=True)
-
-        # write equivalent SPICE subcircuit to tmp file
-        tmp_file = tempfile.NamedTemporaryFile(suffix='.sp', delete=False)
-        name = tmp_file.name
-        tmp_file.close()
-        vf.write_spice_subcircuit_s(name)
-
-        # written tmp file should contain 69 lines
-        with open(name) as f:
-            n_lines = len(f.readlines())
-        self.assertEqual(n_lines, 69)
-        os.remove(name)
-
     def test_read_write_npz(self):
         # fit ring slot example network
         nw = skrf.data.ring_slot
@@ -143,6 +122,17 @@ class VectorFittingTestCase(unittest.TestCase):
 
         # check if model is now passive
         self.assertTrue(vf.is_passive())
+
+    def test_autofit(self):
+        vf = skrf.VectorFitting(skrf.data.ring_slot)
+        vf.auto_fit()
+
+        assert vf.get_model_order(vf.poles) == 6
+        assert np.sum(vf.poles.imag == 0.0) == 0
+        assert np.sum(vf.poles.imag > 0.0) == 3
+
+        assert np.allclose(vf.get_rms_error(), 1.2748979815157275e-06)
+
 
 
 suite = unittest.TestLoader().loadTestsFromTestCase(VectorFittingTestCase)

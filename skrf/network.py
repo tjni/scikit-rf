@@ -51,6 +51,7 @@ Connecting Networks
     cascade_list
     de_embed
     flip
+    parallelconnect
 
 
 
@@ -78,7 +79,6 @@ Combining and Splitting Networks
     one_port_2_two_port
     n_oneports_2_nport
     four_oneports_2_twoport
-    three_twoports_2_threeport
     n_twoports_2_nport
     concat_ports
 
@@ -116,6 +116,7 @@ Supporting Functions
     inv
     connect_s
     innerconnect_s
+    innerconnect_s_lstsq
     s2z
     s2y
     s2t
@@ -164,17 +165,33 @@ from itertools import product
 from numbers import Number
 from pathlib import Path
 from pickle import UnpicklingError
-from typing import Any, Callable, NoReturn, Sequence, Sized, TextIO
+from typing import Any, Callable, Literal, NoReturn, Sequence, Sized, TextIO, get_args
 
-import numpy as npy
+import numpy as np
 from numpy import gradient, ndarray, shape
 from numpy.linalg import inv as npy_inv
 from scipy import stats  # for Network.add_noise_*, and Network.windowed
+from scipy.integrate import cumulative_trapezoid
 from scipy.interpolate import interp1d  # for Network.interpolate()
 
 from . import mathFunctions as mf
 from . import plotting as rfplt
-from .constants import K_BOLTZMANN, S_DEF_DEFAULT, S_DEFINITIONS, T0, ZERO, NumberLike
+from .constants import (
+    K_BOLTZMANN,
+    S_DEF_DEFAULT,
+    S_DEFINITIONS,
+    T0,
+    ZERO,
+    CircuitComponentT,
+    ComponentFuncT,
+    CoordT,
+    FrequencyUnitT,
+    InterpolKindT,
+    NumberLike,
+    PrimaryPropertiesT,
+    SdefT,
+    SparamFormatT,
+)
 from .frequency import Frequency
 from .time import get_window, time_gate
 from .util import Axes, axes_kwarg, copy_doc, find_nearest_index, get_extn, get_fid, partial_with_docs
@@ -264,33 +281,32 @@ class Network:
     ----------
     .. [#TwoPortWiki] http://en.wikipedia.org/wiki/Two-port_network
     """
-
-    PRIMARY_PROPERTIES = ['s', 'z', 'y', 'a', 'h', 't']
+    PRIMARY_PROPERTIES: tuple[PrimaryPropertiesT, ...] = get_args(PrimaryPropertiesT)
     """
     Primary Network Properties list like 's', 'z', 'y', etc.
     """
 
-    COMPONENT_FUNC_DICT = {
-        're': npy.real,
-        'im': npy.imag,
-        'mag': npy.abs,
-        'db': mf.complex_2_db,
-        'db10': mf.complex_2_db10,
-        'rad': npy.angle,
-        'deg': lambda x: npy.angle(x, deg=True),
-        'arcl': lambda x: npy.angle(x) * npy.abs(x),
-        'rad_unwrap': lambda x: mf.unwrap_rad(npy.angle(x)),
-        'deg_unwrap': lambda x: mf.radian_2_degree(mf.unwrap_rad( \
-            npy.angle(x))),
-        'arcl_unwrap': lambda x: mf.unwrap_rad(npy.angle(x)) * \
-                                    npy.abs(x),
-        'vswr': lambda x: (1 + abs(x)) / (1 - abs(x)),
-        'time': mf.ifft,
-        'time_db': lambda x: mf.complex_2_db(mf.ifft(x)),
-        'time_mag': lambda x: mf.complex_2_magnitude(mf.ifft(x)),
-        'time_impulse': None,
-        'time_step': None,
+    _func_lookup: dict[ComponentFuncT, tuple[str, Callable | None]] = {
+        're': ('Real Part', np.real),
+        'im': ('Imag Part', np.imag),
+        'mag': ('Magnitude', np.abs),
+        'db': ('Magnitude (dB)', mf.complex_2_db),
+        'db10': ('Magnitude (dB)', mf.complex_2_db10),
+        'rad': ('Phase (rad)', np.angle),
+        'deg': ('Phase (deg)', lambda x: np.angle(x, deg=True)),
+        'arcl': ('Arc Length',lambda x: np.angle(x) * np.abs(x)),
+        'rad_unwrap': ('Phase (rad)', lambda x: mf.unwrap_rad(np.angle(x))),
+        'deg_unwrap': ('Phase (deg)', lambda x: mf.radian_2_degree(mf.unwrap_rad(np.angle(x)))),
+        'arcl_unwrap': ('Arc Length', lambda x: mf.unwrap_rad(np.angle(x)) * np.abs(x)),
+        'vswr': ('VSWR', lambda x: (1 + abs(x)) / (1 - abs(x))),
+        'time': ('Time (real)', mf.ifft),
+        'time_db': ('Magnitude (dB)',  lambda x: mf.complex_2_db(mf.ifft(x))),
+        'time_mag': ('Magnitude', lambda x: mf.complex_2_magnitude(mf.ifft(x))),
+        'time_impulse': ('Magnitude', None),
+        'time_step': ('Magnitude', None),
     }
+
+    COMPONENT_FUNC_DICT: dict[ComponentFuncT, Callable | None] = {k: v[1] for k,v in _func_lookup.items()}
 
     """
     Component functions like 're', 'im', 'mag', 'db', etc.
@@ -303,42 +319,15 @@ class Network:
             for func_name, func in cls.COMPONENT_FUNC_DICT.items()}
 
     # provides y-axis labels to the plotting functions
-    Y_LABEL_DICT = {
-        're': 'Real Part',
-        'im': 'Imag Part',
-        'mag': 'Magnitude',
-        'abs': 'Magnitude',
-        'db': 'Magnitude (dB)',
-        'db10': 'Magnitude (dB)',
-        'deg': 'Phase (deg)',
-        'deg_unwrap': 'Phase (deg)',
-        'rad': 'Phase (rad)',
-        'rad_unwrap': 'Phase (rad)',
-        'arcl': 'Arc Length',
-        'arcl_unwrap': 'Arc Length',
-        'gd': 'Group Delay (s)',
-        'vswr': 'VSWR',
-        'passivity': 'Passivity',
-        'reciprocity': 'Reciprocity',
-        'time': 'Time (real)',
-        'time_db': 'Magnitude (dB)',
-        'time_mag': 'Magnitude',
-        'time_impulse': 'Magnitude',
-        'time_step': 'Magnitude',
-    }
+    Y_LABEL_DICT: dict[ComponentFuncT, str]  = {k: v[0] for k,v in _func_lookup.items()}
     """
     Y-axis labels to the plotting functions.
     """
 
-    noise_interp_kind = 'linear'
-    """
-    Default interpolation method.
-    """
-
     # CONSTRUCTOR
     def __init__(self, file: str = None, name: str = None, params: dict = None,
-                 comments: str = None, f_unit: str = None,
-                 s_def: str | None = None, **kwargs) -> None:
+                 comments: str = None, f_unit: FrequencyUnitT | None = None,
+                 s_def: SdefT | None = None, **kwargs) -> None:
         r"""
         Network constructor.
 
@@ -349,7 +338,7 @@ class Network:
         Parameters
         ----------
 
-        file : str or file-object
+        file : str, Path, or file-object
             file to load information from. supported formats are:
              * touchstone file (.s?p) (or .ts)
              * io.StringIO object (with `.name` property which contains the file extension, such as `myfile.s4p`)
@@ -370,6 +359,13 @@ class Network:
             key word arguments can be used to assign properties of the
             Network, such as `s`, `f` and `z0`.
             keyword `encoding` can be used to define the Touchstone file encoding.
+            keyword `noise_interp_kind` used to change the default interpolation
+                     method for noisy networks. Options are 'linear', 'nearest',
+                     'nearest-up', 'zero', 'slinear', 'quadratic', 'cubic',
+                     'previous', or 'next'. Review `scipy.interpolate.interp_1d`
+                     for details on each interpolation style. Defaults to 'linear'.
+            keyword `noise_fill_value` used to change the default interpolation
+                     fill value for noisy networks. Defaults to np.nan.
 
         Examples
         --------
@@ -384,7 +380,7 @@ class Network:
         Create a blank network, then fill in values
 
         >>> n = rf.Network()
-        >>> freq = rf.Frequency(1, 3, 3, 'ghz')
+        >>> freq = rf.Frequency(1, 3, 3, 'GHz')
         >>> n.frequency, n.s, n.z0 = freq, [1,2,3], [1,2,3]
 
         Directly from values
@@ -406,6 +402,12 @@ class Network:
         if 'touchstone_filename' in kwargs:
             file = kwargs['touchstone_filename']
 
+        # Default interpolation method.
+        self.noise_interp_kind = kwargs.get("noise_interp_kind", "linear")
+
+        # Default noise fill value when out of the s-parameter frequency bounds.
+        self.noise_fill_value = kwargs.get("noise_fill_value", np.nan)
+
         self.name = name
         self.params = params
         self.comments = comments
@@ -415,7 +417,9 @@ class Network:
         self.deembed = None
         self.noise = None
         self.noise_freq = None
-        self._z0 = npy.array(50, dtype=complex)
+        self._z0 = np.array(50, dtype=complex)
+        self._port_modes = np.array([])
+        self._ext_attrs: dict[CircuitComponentT, bool] = {}
 
         if s_def not in S_DEFINITIONS and s_def is not None:
             raise ValueError('s_def parameter should be either:', S_DEFINITIONS)
@@ -423,11 +427,11 @@ class Network:
             self.s_def = s_def
 
         if file is not None:
-            if isinstance(file, Path):
-                file = str(file.resolve())
 
             # allows user to pass StringIO, filename or file obj
             if isinstance(file, io.StringIO):
+                if not hasattr(file, "name") and name is not None:
+                    file.name = name
                 self.read_touchstone(file, self.encoding)
 
             else:
@@ -471,11 +475,12 @@ class Network:
         # to determine the correct z0 shape afterwards.
 
         if params:
-            s_shape = npy.array(kwargs[params[0]]).shape
-            self.s = npy.zeros(s_shape, dtype=complex)
+            s_shape = np.array(kwargs[params[0]]).shape
+            self.s = np.zeros(s_shape, dtype=complex)
 
         self.z0 = kwargs.get('z0', self._z0)
-        self.port_modes = npy.array(["S"] * self.nports)
+        if not len(self.port_modes):
+            self.port_modes = np.array(["S"] * self.nports)
 
 
         if "f" in kwargs.keys():
@@ -483,12 +488,12 @@ class Network:
                 f_unit = "hz"
             kwargs["frequency"] = Frequency.from_f(kwargs.pop("f"), unit=f_unit)
 
-        for attr in PRIMARY_PROPERTIES + ['frequency', 'noise', 'noise_freq']:
+        for attr in list(PRIMARY_PROPERTIES) + ['frequency', 'noise', 'noise_freq']:
             if attr in kwargs:
                 self.__setattr__(attr, kwargs[attr])
 
     @classmethod
-    def from_z(cls, z: npy.ndarray, *args, **kw) -> Network:
+    def from_z(cls, z: np.ndarray, *args, **kw) -> Network:
         r"""
         Create a Network from its Z-parameters.
 
@@ -513,7 +518,7 @@ class Network:
         >>> ntw = rf.Network.from_z(z, f=f)
 
         """
-        s = npy.zeros(shape=z.shape)
+        s = np.zeros(shape=z.shape)
         me = cls(s=s, **kw)
         me.z = z
         return me
@@ -656,7 +661,7 @@ class Network:
             result.s = self.s * other.s
         else:
             # other may be an array or a number
-            result.s = self.s * npy.asarray(other).reshape(-1, self.nports, self.nports)
+            result.s = self.s * np.asarray(other).reshape(-1, self.nports, self.nports)
 
         return result
 
@@ -676,7 +681,7 @@ class Network:
             result.s = self.s * other.s
         else:
             # other may be an array or a number
-            result.s = self.s * npy.asarray(other).reshape(-1, self.nports, self.nports)
+            result.s = self.s * np.asarray(other).reshape(-1, self.nports, self.nports)
 
         return result
 
@@ -695,7 +700,7 @@ class Network:
             result.s = self.s + other.s
         else:
             # other may be an array or a number
-            result.s = self.s + npy.asarray(other).reshape(-1, self.nports, self.nports)
+            result.s = self.s + np.asarray(other).reshape(-1, self.nports, self.nports)
 
         return result
 
@@ -714,7 +719,7 @@ class Network:
             result.s = self.s + other.s
         else:
             # other may be an array or a number
-            result.s = self.s + npy.asarray(other).reshape(-1, self.nports, self.nports)
+            result.s = self.s + np.asarray(other).reshape(-1, self.nports, self.nports)
 
         return result
 
@@ -729,7 +734,7 @@ class Network:
             result.s = self.s - other.s
         else:
             # other may be an array or a number
-            result.s = self.s - npy.asarray(other).reshape(-1, self.nports, self.nports)
+            result.s = self.s - np.asarray(other).reshape(-1, self.nports, self.nports)
 
         return result
 
@@ -748,7 +753,7 @@ class Network:
             result.s = other.s - self.s
         else:
             # other may be an array or a number
-            result.s = npy.asarray(other).reshape(-1, self.nports, self.nports) - self.s
+            result.s = np.asarray(other).reshape(-1, self.nports, self.nports) - self.s
 
         return result
 
@@ -770,7 +775,7 @@ class Network:
             result.s = self.s / other.s
         else:
             # other may be an array or a number
-            result.s = self.s / npy.asarray(other).reshape(-1, self.nports, self.nports)
+            result.s = self.s / np.asarray(other).reshape(-1, self.nports, self.nports)
 
         return result
 
@@ -780,14 +785,14 @@ class Network:
         if len(self.f) != len(other.f):
             return False
         for prop in ['f','s','z0']:
-            if not npy.all(npy.abs(getattr(self,prop)-getattr(other,prop))< ZERO):
+            if not np.all(np.abs(getattr(self,prop)-getattr(other,prop))< ZERO):
                 return False
         # if z0 is imaginary s_def is compared. If real of z0 is equal but s_def differs, networks are still equal
-        if ((npy.imag(self.z0) != 0).all()) or ((npy.imag(other.z0) != 0).all()):
+        if ((np.imag(self.z0) != 0).all()) or ((np.imag(other.z0) != 0).all()):
             if self.s_def == other.s_def:
                 return True
             else:
-                return npy.allclose(self.z0.real, other.z0.real, atol = ZERO)
+                return np.allclose(self.z0.real, other.z0.real, atol = ZERO)
         else:
             return True
 
@@ -946,13 +951,13 @@ class Network:
 
         return ret + s_properties
 
-    def attribute(self, prop_name: str, conversion: str) -> npy.ndarray:
+    def attribute(self, prop_name: PrimaryPropertiesT, conversion: ComponentFuncT) -> np.ndarray:
         prop = getattr(self, prop_name)
         return self.COMPONENT_FUNC_DICT[conversion](prop)
 
     # PRIMARY PROPERTIES
     @property
-    def s(self) -> npy.ndarray:
+    def s(self) -> np.ndarray:
         """
         Scattering parameter matrix.
 
@@ -982,7 +987,7 @@ class Network:
         return self._s
 
     @s.setter
-    def s(self, s: npy.ndarray) -> None:
+    def s(self, s: np.ndarray) -> None:
         """
         Scattering parameter matrix.
 
@@ -991,6 +996,8 @@ class Network:
         s : :class:`numpy.ndarray`
             The input s-matrix should be of shape `fxnxn`,
             where f is frequency axis and n is number of ports.
+            Note that to set this requires that the values are
+            given in complex format. DB and MA aren't automatically translated
 
         """
         self._s = fix_param_shape(s)
@@ -998,8 +1005,11 @@ class Network:
         if self.z0.ndim == 0:
             self.z0 = self.z0
 
+        if len(self.port_modes) != self.nports:
+            self.port_modes = np.array(["S"] * self.nports)
+
     @property
-    def s_traveling(self) -> npy.ndarray:
+    def s_traveling(self) -> np.ndarray:
         """
         Scattering parameter matrix with s_def = 'traveling'.
 
@@ -1022,11 +1032,11 @@ class Network:
         return s2s(self._s, self.z0, 'traveling', self.s_def)
 
     @s_traveling.setter
-    def s_traveling(self, s) -> npy.ndarray:
+    def s_traveling(self, s) -> np.ndarray:
         self.s = s2s(s, self.z0, self.s_def, 'traveling')
 
     @property
-    def s_power(self) -> npy.ndarray:
+    def s_power(self) -> np.ndarray:
         """
         Scattering parameter matrix with s_def = 'power'.
 
@@ -1049,11 +1059,11 @@ class Network:
         return s2s(self._s, self.z0, 'power', self.s_def)
 
     @s_power.setter
-    def s_power(self, s) -> npy.ndarray:
+    def s_power(self, s) -> np.ndarray:
         self.s = s2s(s, self.z0, self.s_def, 'power')
 
     @property
-    def s_pseudo(self) -> npy.ndarray:
+    def s_pseudo(self) -> np.ndarray:
         """
         Scattering parameter matrix with s_def = 'pseudo'.
 
@@ -1076,11 +1086,11 @@ class Network:
         return s2s(self._s, self.z0, 'pseudo', self.s_def)
 
     @s_pseudo.setter
-    def s_pseudo(self, s) -> npy.ndarray:
+    def s_pseudo(self, s) -> np.ndarray:
         self.s = s2s(s, self.z0, self.s_def, 'pseudo')
 
     @property
-    def h(self) -> npy.ndarray:
+    def h(self) -> np.ndarray:
         """
         Hybrid parameter matrix.
 
@@ -1111,11 +1121,11 @@ class Network:
         return s2h(self.s, self.z0)
 
     @h.setter
-    def h(self, value: npy.ndarray) -> None:
+    def h(self, value: np.ndarray) -> None:
         self._s = h2s(fix_param_shape(value), self.z0)
 
     @property
-    def y(self) -> npy.ndarray:
+    def y(self) -> np.ndarray:
         """
         Admittance parameter matrix.
 
@@ -1145,11 +1155,11 @@ class Network:
         return s2y(self._s, self.z0, s_def=self.s_def)
 
     @y.setter
-    def y(self, value: npy.ndarray) -> None:
+    def y(self, value: np.ndarray) -> None:
         self._s = y2s(fix_param_shape(value), self.z0, s_def=self.s_def)
 
     @property
-    def z(self) -> npy.ndarray:
+    def z(self) -> np.ndarray:
         """
         Impedance parameter matrix.
 
@@ -1179,11 +1189,11 @@ class Network:
         return s2z(self._s, self.z0, s_def=self.s_def)
 
     @z.setter
-    def z(self, value: npy.ndarray) -> None:
+    def z(self, value: np.ndarray) -> None:
         self._s = z2s(fix_param_shape(value), self.z0, s_def=self.s_def)
 
     @property
-    def t(self) -> npy.ndarray:
+    def t(self) -> np.ndarray:
         """
         Scattering transfer parameter matrix.
 
@@ -1197,7 +1207,7 @@ class Network:
 
         Returns
         -------
-        t : complex npy.ndarray of shape `fx2x2`
+        t : complex np.ndarray of shape `fx2x2`
                 t-parameters, aka scattering transfer parameters
 
 
@@ -1216,11 +1226,11 @@ class Network:
         return s2t(self.s)
 
     @t.setter
-    def t(self, value: npy.ndarray) -> None:
+    def t(self, value: np.ndarray) -> None:
         self._s = t2s(fix_param_shape(value))
 
     @property
-    def s_invert(self) -> npy.ndarray:
+    def s_invert(self) -> np.ndarray:
         """
         Inverted scattering parameter matrix.
 
@@ -1248,11 +1258,11 @@ class Network:
         return 1 / self.s
 
     @s_invert.setter
-    def s_invert(self, value: npy.ndarray) -> NoReturn:
+    def s_invert(self, value: np.ndarray) -> NoReturn:
         raise NotImplementedError
 
     @property
-    def a(self) -> npy.ndarray:
+    def a(self) -> np.ndarray:
         """
         abcd parameter matrix. Used to cascade two-ports.
 
@@ -1283,11 +1293,11 @@ class Network:
         return s2a(self.s, self.z0)
 
     @a.setter
-    def a(self, value: npy.ndarray) -> None:
+    def a(self, value: np.ndarray) -> None:
         self._s = a2s(fix_param_shape(value), self.z0)
 
     @property
-    def z0(self) -> npy.ndarray:
+    def z0(self) -> np.ndarray:
         """
         Characteristic impedance[s] of the network ports.
 
@@ -1309,8 +1319,8 @@ class Network:
 
     @z0.setter
     def z0(self, z0: NumberLike) -> None:
-        # cast any array like type (tuple, list) to a npy.array
-        z0 = npy.array(z0, dtype=complex)
+        # cast any array like type (tuple, list) to a np.array
+        z0 = np.array(z0, dtype=complex)
 
         # if _z0 is a vector or matrix, we check if _s is already assigned.
         # If not, we cannot proof the correct dimensions and silently accept
@@ -1327,7 +1337,7 @@ class Network:
         #
         # if _z0 is a matrix, we check if the shape matches with _s
         # In any other case raise an Exception
-        self._z0 = npy.empty(self.s.shape[:2], dtype=complex)
+        self._z0 = np.empty(self.s.shape[:2], dtype=complex)
         if z0.ndim == 0:
             self._z0[:] = z0
         elif z0.ndim == 1 and z0.shape[0] == self.s.shape[0]:
@@ -1370,7 +1380,7 @@ class Network:
             return self._frequency
 
     @frequency.setter
-    def frequency(self, new_frequency: Frequency | int | Sequence[float] | npy.ndarray) -> None:
+    def frequency(self, new_frequency: Frequency | int | Sequence[float] | np.ndarray) -> None:
         """
         Take a Frequency object, see frequency.py.
         """
@@ -1378,7 +1388,7 @@ class Network:
             self._frequency = new_frequency.copy()
         else:
             try:
-                self._frequency = Frequency.from_f(new_frequency)
+                self._frequency = Frequency.from_f(new_frequency, unit=self.frequency.unit)
             except TypeError as err:
                 raise TypeError('Could not convert argument to a frequency vector') from err
 
@@ -1404,11 +1414,15 @@ class Network:
             raise (TypeError('One-Port Networks don\'t have inverses'))
         out = self.copy()
         out.s = inv(self.s)
+        # flip the port impedances, nports is even guaranteed by inv() method
+        port_pairs: int = self.nports // 2
+        out.z0[:, :port_pairs] = self.z0[:, port_pairs:]
+        out.z0[:, port_pairs:] = self.z0[:, :port_pairs]
         out.deembed = True
         return out
 
     @property
-    def f(self) -> npy.ndarray:
+    def f(self) -> np.ndarray:
         """
         The frequency vector for the network, in Hz.
 
@@ -1443,24 +1457,35 @@ class Network:
       return self.noise is not None and self.noise_freq is not None
 
     @property
-    def n(self) -> npy.ndarray:
+    def n(self) -> np.ndarray:
         """
         The ABCD form of the noise correlation matrix for the network.
         """
         if not self.noisy:
             raise ValueError('network does not have noise')
 
-        if self.noise_freq.f.size > 1 :
-            noise_real = interp1d(self.noise_freq.f, self.noise.real, axis=0, kind=Network.noise_interp_kind)
-            noise_imag = interp1d(self.noise_freq.f, self.noise.imag, axis=0, kind=Network.noise_interp_kind)
+        if self.noise_freq.f.size > 1:
+            noise_real = interp1d(
+                self.noise_freq.f,
+                self.noise.real,
+                axis=0,
+                kind=self.noise_interp_kind,
+                bounds_error=False,
+                fill_value=complex(self.noise_fill_value).real
+            )
+            noise_imag = interp1d(
+                self.noise_freq.f,
+                self.noise.imag,
+                axis=0,
+                kind=self.noise_interp_kind,
+                bounds_error=False,
+                fill_value=complex(self.noise_fill_value).imag
+            )
             return noise_real(self.frequency.f) + 1.0j * noise_imag(self.frequency.f)
-        else :
-            noise_real =  self.noise.real
+        else:
+            noise_real = self.noise.real
             noise_imag = self.noise.imag
             return noise_real + 1.0j * noise_imag
-
-
-
 
     @property
     def f_noise(self) -> Frequency:
@@ -1472,44 +1497,44 @@ class Network:
       return self.noise_freq
 
     @property
-    def y_opt(self) -> npy.ndarray:
+    def y_opt(self) -> np.ndarray:
       """
       The optimum source admittance to minimize noise.
       """
       noise = self.n
-      return (npy.sqrt(noise[:,1,1]/noise[:,0,0] - npy.square(npy.imag(noise[:,0,1]/noise[:,0,0])))
-          + 1.j*npy.imag(noise[:,0,1]/noise[:,0,0]))
+      return (np.sqrt(noise[:,1,1]/noise[:,0,0] - np.square(np.imag(noise[:,0,1]/noise[:,0,0])))
+          + 1.j*np.imag(noise[:,0,1]/noise[:,0,0]))
 
     @property
-    def z_opt(self) -> npy.ndarray:
+    def z_opt(self) -> np.ndarray:
       """
       The optimum source impedance to minimize noise.
       """
       return 1./self.y_opt
 
     @property
-    def g_opt(self) -> npy.ndarray:
+    def g_opt(self) -> np.ndarray:
       """
       The optimum source reflection coefficient to minimize noise.
       """
       return z2s(self.z_opt.reshape((self.f.shape[0], 1, 1)), self.z0[:,0])[:,0,0]
 
     @property
-    def nfmin(self) -> npy.ndarray:
+    def nfmin(self) -> np.ndarray:
       """
       The minimum noise figure for the network.
       """
       noise = self.n
-      return npy.real(1. + (noise[:,0,1] + noise[:,0,0] * npy.conj(self.y_opt))/(2*K_BOLTZMANN*T0))
+      return np.real(1. + (noise[:,0,1] + noise[:,0,0] * np.conj(self.y_opt))/(2*K_BOLTZMANN*T0))
 
     @property
-    def nfmin_db(self) -> npy.ndarray:
+    def nfmin_db(self) -> np.ndarray:
       """
       The minimum noise figure for the network in dB.
       """
       return mf.complex_2_db10(self.nfmin)
 
-    def nf(self, z: NumberLike) -> npy.ndarray:
+    def nf(self, z: NumberLike) -> np.ndarray:
       """
       The noise figure for the network if the source impedance is z.
       """
@@ -1518,10 +1543,10 @@ class Network:
       rn = self.rn
 
       ys = 1./z
-      gs = npy.real(ys)
-      return fmin + rn/gs * npy.square(npy.absolute(ys - y_opt))
+      gs = np.real(ys)
+      return fmin + rn/gs * np.square(np.absolute(ys - y_opt))
 
-    def nfdb_gs(self, gs: NumberLike) -> npy.ndarray:
+    def nfdb_gs(self, gs: NumberLike) -> np.ndarray:
       """
       Return dB(NF) foreach gamma_source x noise_frequency.
       """
@@ -1530,23 +1555,23 @@ class Network:
 
       if isinstance(gs, (int, float, complex)) :
           g.s[:,0,0] = gs
-          nfdb = 10.*npy.log10(self.nf( g.z[:,0,0]))
-      elif isinstance(gs, npy.ndarray) :
+          nfdb = 10.*np.log10(self.nf( g.z[:,0,0]))
+      elif isinstance(gs, np.ndarray) :
           npt =  gs.shape[0]
           z = self.z0[0,0] * (1+gs)/(1-gs)
-          zf = npy.broadcast_to(z[:,None], tuple((npt, nfreq)))
-          nfdb = 10.*npy.log10(self.nf( zf))
+          zf = np.broadcast_to(z[:,None], tuple((npt, nfreq)))
+          nfdb = 10.*np.log10(self.nf( zf))
       else :
           g.s[:,0,0] = -1
-          nfdb = 10.*npy.log10(self.nf( g.z[:,0,0]))
+          nfdb = 10.*np.log10(self.nf( g.z[:,0,0]))
       return nfdb
 
     @property
-    def rn(self) -> npy.ndarray:
+    def rn(self) -> np.ndarray:
       """
       The equivalent noise resistance for the network.
       """
-      return npy.real(self.n[:,0,0]/(4.*K_BOLTZMANN*T0))
+      return np.real(self.n[:,0,0]/(4.*K_BOLTZMANN*T0))
 
     # SECONDARY PROPERTIES
     @property
@@ -1577,6 +1602,30 @@ class Network:
 
         """
         return self.number_of_ports
+
+    @property
+    def port_modes(self) -> np.ndarray:
+        """
+        Array of size nports with the mode of each port.
+
+        This information is used to store mixed-modes networks in touchstone
+        V2 format or to plot trace name with subscript like 'Sdd11'.
+
+        * 'C': common
+        * 'D': differential
+        * 'S': single-ended
+
+        Returns
+        -------
+        port_modes : :class:`numpy.ndarray`
+                port modes
+
+        """
+        return self._port_modes
+
+    @port_modes.setter
+    def port_modes(self, port_modes: np.ndarray) -> None:
+        self._port_modes = port_modes
 
     @property
     def port_tuples(self) -> list[tuple[int, int]]:
@@ -1642,7 +1691,7 @@ class Network:
         return passivity(self.s)
 
     @property
-    def reciprocity(self) -> npy.ndarray:
+    def reciprocity(self) -> np.ndarray:
         """
         Reciprocity metric for a multi-port network.
 
@@ -1665,7 +1714,7 @@ class Network:
         return reciprocity(self.s)
 
     @property
-    def reciprocity2(self) -> npy.ndarray:
+    def reciprocity2(self) -> np.ndarray:
         """
         Reciprocity metric #2
 
@@ -1684,7 +1733,7 @@ class Network:
         return abs(1 - self.s / self.s.swapaxes(1, 2))
 
     @property
-    def stability(self) -> npy.ndarray:
+    def stability(self) -> np.ndarray:
         """
         Stability factor.
 
@@ -1709,15 +1758,15 @@ class Network:
             raise ValueError("Stability factor K is only defined for two ports")
 
         D = self.s[:, 0, 0] * self.s[:, 1, 1] - self.s[:, 0, 1] * self.s[:, 1, 0]
-        denom = 2 * npy.abs(self.s[:, 0, 1]) * npy.abs(self.s[:, 1, 0])
-        num = (1 - npy.abs(self.s[:, 0, 0]) ** 2 - npy.abs(self.s[:, 1, 1]) ** 2 + npy.abs(D) ** 2)
-        infs = npy.full(num.shape, npy.inf)
+        denom = 2 * np.abs(self.s[:, 0, 1]) * np.abs(self.s[:, 1, 0])
+        num = (1 - np.abs(self.s[:, 0, 0]) ** 2 - np.abs(self.s[:, 1, 1]) ** 2 + np.abs(D) ** 2)
+        infs = np.full(num.shape, np.inf)
         # Handle divide by zero
-        K = npy.divide(num, denom, out=infs, where=denom!=0)
+        K = np.divide(num, denom, out=infs, where=denom!=0)
         return K
 
     @property
-    def max_stable_gain(self) -> npy.ndarray:
+    def max_stable_gain(self) -> np.ndarray:
         r"""
         Maximum stable power gain (in linear).
 
@@ -1745,11 +1794,11 @@ class Network:
         if self.nports != 2:
             raise ValueError("Maximum stable gain is only defined for two ports")
 
-        gms = npy.abs(self.s[:, 1, 0]) / npy.abs(self.s[:, 0, 1])
+        gms = np.abs(self.s[:, 1, 0]) / np.abs(self.s[:, 0, 1])
         return gms
 
     @property
-    def max_gain(self) -> npy.ndarray:
+    def max_gain(self) -> np.ndarray:
         r"""
         Maximum available power gain for K > 1 and maximum stable power gain for K <= 1 (in linear).
 
@@ -1789,12 +1838,12 @@ class Network:
             raise ValueError("Max gain is only defined for two ports")
 
         K = self.stability
-        K_clipped = npy.clip(K, 1, None)
-        gmax = self.max_stable_gain / (K_clipped + npy.sqrt(npy.square(K_clipped) - 1))
+        K_clipped = np.clip(K, 1, None)
+        gmax = self.max_stable_gain / (K_clipped + np.sqrt(np.square(K_clipped) - 1))
         return gmax
 
     @property
-    def unilateral_gain(self) -> npy.ndarray:
+    def unilateral_gain(self) -> np.ndarray:
         r"""
         Mason's unilateral power gain (in linear).
 
@@ -1824,12 +1873,12 @@ class Network:
 
         K = self.stability
         gms = self.max_stable_gain
-        U = (npy.abs((self.s[:, 1, 0] / self.s[:, 0, 1]) - 1) ** 2
-            / (2 * K * gms - 2 * npy.real(self.s[:, 1, 0] / self.s[:, 0, 1])))
+        U = (np.abs((self.s[:, 1, 0] / self.s[:, 0, 1]) - 1) ** 2
+            / (2 * K * gms - 2 * np.real(self.s[:, 1, 0] / self.s[:, 0, 1])))
         return U
 
     @property
-    def group_delay(self) -> npy.ndarray:
+    def group_delay(self) -> np.ndarray:
         """
         Group delay.
 
@@ -1878,7 +1927,7 @@ class Network:
         reciprocity
 
         """
-        return npy.allclose(reciprocity(self.s), npy.zeros_like(self.s), atol=tol)
+        return np.allclose(reciprocity(self.s), np.zeros_like(self.s), atol=tol)
 
     def is_symmetric(self, n: int = 1, port_order: dict[int, int] = None, tol: float = mf.ALMOST_ZERO) -> bool:
         """
@@ -1934,12 +1983,12 @@ class Network:
         if len(from_ports) > 0 and len(to_ports) > 0:
             test_network.renumber(from_ports, to_ports)
 
-        offs = npy.array(range(0, n_ports))  # port index offsets from each mirror line
+        offs = np.array(range(0, n_ports))  # port index offsets from each mirror line
         for k in range(0, n_ports, n_ports // n):  # iterate through n mirror lines
-            mirror = k * npy.ones_like(offs)
+            mirror = k * np.ones_like(offs)
             i = mirror - 1 - offs
             j = mirror + offs
-            if not npy.allclose(test_network.s[:, i, i], test_network.s[:, j, j], atol=tol):
+            if not np.allclose(test_network.s[:, i, i], test_network.s[:, j, j], atol=tol):
                 return False
         return True
 
@@ -1958,11 +2007,11 @@ class Network:
 
         """
         try:
-            M = npy.square(self.passivity)
+            M = np.square(self.passivity)
         except ValueError:
             return False
 
-        I = npy.identity(M.shape[-1])
+        I = np.identity(M.shape[-1])
         for f_idx in range(len(M)):
             D = I - M[f_idx, :, :]  # dissipation matrix
             if not mf.is_positive_definite(D) \
@@ -2001,12 +2050,29 @@ class Network:
         return True
 
     ## CLASS METHODS
-    def copy(self) -> Network:
+    def copy(self, *, shallow_copy: bool = False) -> Network:
         """
         Return a copy of this Network.
 
         Needed to allow pass-by-value for a Network instead of
         pass-by-reference
+
+        Parameters
+        ----------
+        shallow_copy : bool, optional
+            If True, the method creates a new Network object with empty s-parameters that share the same shape
+            as the original Network, but without copying the actual s-parameters data. This is useful when you
+            plan to immediately modify the s-parameters after creating the Network, as a deep copy would be
+            unnecessary and costly. Using `shallow_copy` improves performance by leveraging lazy initialization
+            through `numpy's np.empty()`, which allocates virtual memory without immediate physical memory
+            allocation, deferring actual memory initialization until first access. This approach can significantly
+            enhance `copy()` performance when dealing with large `Network` objects, when you are intended for
+            immediate modification after the Network's creation.
+
+        Note
+        ----
+        If you require a complete copy of the `Network` instance or need to perform operation on the s-parameters
+        of the copied Network, it is essential not to use the `shallow_copy` parameter!
 
         Returns
         -------
@@ -2014,11 +2080,16 @@ class Network:
             Copy of the Network
 
         """
-        ntwk = Network(s=self.s,
-                       frequency=self.frequency,
-                       z0=self.z0, s_def=self.s_def,
-                       comments=self.comments
-                       )
+        ntwk = Network(z0=self.z0, s_def=self.s_def, comments=self.comments)
+
+        ntwk._s = (
+            np.empty(shape=self.s.shape, dtype=self.s.dtype)
+            if shallow_copy
+            else self.s.copy()
+        )
+        ntwk.frequency._f = self.frequency._f.copy()
+        ntwk.frequency.unit = self.frequency.unit
+        ntwk.port_modes = self.port_modes.copy()
 
         if self.params is not None:
             ntwk.params = self.params.copy()
@@ -2028,6 +2099,9 @@ class Network:
         if self.noise is not None and self.noise_freq is not None:
           ntwk.noise = self.noise.copy()
           ntwk.noise_freq = self.noise_freq.copy()
+
+        # copy special attributes (such as _is_circuit_port) but skip methods
+        ntwk._ext_attrs = self._ext_attrs.copy()
 
         try:
             ntwk.port_names = copy(self.port_names)
@@ -2055,7 +2129,7 @@ class Network:
         for attr in ['_s', 'frequency', '_z0', 'name']:
             setattr(self, attr, copy(getattr(other, attr)))
 
-    def copy_subset(self, key: npy.ndarray) -> Network:
+    def copy_subset(self, key: np.ndarray) -> Network:
         """
         Return a copy of a frequency subset of this Network.
 
@@ -2084,7 +2158,7 @@ class Network:
             ntwk.name = self.name
 
         if self.noise is not None and self.noise_freq is not None:
-            ntwk.noise = npy.copy(self.noise[key,:])
+            ntwk.noise = np.copy(self.noise[key,:])
             ntwk.noise_freq = copy(self.noise_freq[key])
 
         try:
@@ -2119,13 +2193,13 @@ class Network:
 
         # z0 getter and setter depend on s.shape matching z0.shape.
         # Call z0 getter and setter only when s and z0 shapes match.
-        z0_new = npy.delete(self.z0, idx, axis=0)
-        self.s = npy.delete(self.s, idx, axis=0)
+        z0_new = np.delete(self.z0, idx, axis=0)
+        self.s = np.delete(self.s, idx, axis=0)
         self.z0 = z0_new
 
         if self.noisy:
             idx = self.noise_freq.drop_non_monotonic_increasing()
-            self.noise = npy.delete(self.noise, idx, axis=0)
+            self.noise = np.delete(self.noise, idx, axis=0)
 
 
     def set_noise_a(self, noise_freq: Frequency = None, nfmin_db: float = 0,
@@ -2135,17 +2209,17 @@ class Network:
           noise frequency and input parameters.
           """
           sh_fr = noise_freq.f.shape
-          nfmin_db = npy.broadcast_to(npy.atleast_1d(nfmin_db), sh_fr)
-          gamma_opt = npy.broadcast_to(npy.atleast_1d(gamma_opt), sh_fr)
-          rn = npy.broadcast_to(npy.atleast_1d(rn), sh_fr)
+          nfmin_db = np.broadcast_to(np.atleast_1d(nfmin_db), sh_fr)
+          gamma_opt = np.broadcast_to(np.atleast_1d(gamma_opt), sh_fr)
+          rn = np.broadcast_to(np.atleast_1d(rn), sh_fr)
 
 
-          nf_min = npy.power(10., nfmin_db/10.)
+          nf_min = np.power(10., nfmin_db/10.)
           # TODO maybe interpolate z0 as above
           y_opt = 1./(self.z0[0, 0] * (1. + gamma_opt)/(1. - gamma_opt))
-          noise = 4.*K_BOLTZMANN*T0*npy.array(
-                [[rn, (nf_min-1.)/2. - rn*npy.conj(y_opt)],
-                [(nf_min-1.)/2. - rn*y_opt, npy.square(npy.absolute(y_opt)) * rn]]
+          noise = 4.*K_BOLTZMANN*T0*np.array(
+                [[rn, (nf_min-1.)/2. - rn*np.conj(y_opt)],
+                [(nf_min-1.)/2. - rn*y_opt, np.square(np.absolute(y_opt)) * rn]]
               )
           self.noise = noise.swapaxes(0, 2).swapaxes(1, 2)
           self.noise_freq = noise_freq
@@ -2154,7 +2228,7 @@ class Network:
 
 
     # touchstone file IO
-    def read_touchstone(self, filename: str | TextIO,
+    def read_touchstone(self, filename: str | Path | TextIO,
                         encoding: str | None = None) -> None:
         """
         Load values from a touchstone file.
@@ -2164,7 +2238,7 @@ class Network:
 
         Parameters
         ----------
-        filename : str or file-object
+        filename : str, Path, or file-object
             touchstone file name.
         encoding : str, optional
             define the file encoding to use. Default value is None,
@@ -2200,7 +2274,7 @@ class Network:
             noise_freq = touchstoneFile.noise[:, 0]
             nfmin_db = touchstoneFile.noise[:, 1]
             gamma_opt_mag = touchstoneFile.noise[:, 2]
-            gamma_opt_angle = npy.deg2rad(touchstoneFile.noise[:, 3])
+            gamma_opt_angle = np.deg2rad(touchstoneFile.noise[:, 3])
 
             # TODO maybe properly interpolate z0?
             # it probably never actually changes
@@ -2209,7 +2283,7 @@ class Network:
             else:
                 rn = touchstoneFile.noise[:, 4]
 
-            gamma_opt = gamma_opt_mag * npy.exp(1j * gamma_opt_angle)
+            gamma_opt = gamma_opt_mag * np.exp(1j * gamma_opt_angle)
 
             # use the voltage/current correlation matrix; this works nicely with
             # cascading networks
@@ -2227,7 +2301,7 @@ class Network:
                 self.name = os.path.basename(os.path.splitext(touchstoneFile.filename)[0])
 
     @classmethod
-    def zipped_touchstone(cls, filename: str, archive: zipfile.ZipFile) -> Network:
+    def zipped_touchstone(cls, filename: str | Path, archive: zipfile.ZipFile) -> Network:
         """
         Read a Network from a Touchstone file in a ziparchive.
 
@@ -2244,6 +2318,10 @@ class Network:
             Network from the Touchstone file
 
         """
+
+        # Convert a path filename to a string
+        filename = str(filename.resolve()) if isinstance(filename, Path) else filename
+
         # Touchstone requires file objects to be seekable (for get_gamma_z0_from_fid)
         # A ZipExtFile object is not seekable prior to Python 3.7, so use StringIO
         # and manually add a name attribute
@@ -2252,20 +2330,24 @@ class Network:
         ntwk = Network(fileobj)
         return ntwk
 
-    def write_touchstone(self, filename: str = None, dir: str = None,
+    def write_touchstone(self, filename: str | Path = None, dir: str | Path = None,
                          write_z0: bool = False, skrf_comment: bool = True,
                          return_string: bool = False, to_archive: bool = None,
-                         form: str = 'ri', format_spec_A: str = '{}', format_spec_B: str = '{}',
-                         format_spec_freq : str = '{}', r_ref : float = None) -> str | None:
+                         form: SparamFormatT = 'ri', format_spec_A: str = '{}', format_spec_B: str = '{}',
+                         format_spec_freq: str = '{}', r_ref: float = None,
+                         format_spec_nf_freq: str = '{}', format_spec_nf_min: str = '{}',
+                         format_spec_g_opt_mag: str = '{}', format_spec_g_opt_phase: str = '{}',
+                         format_spec_rn: str = '{}') -> str | None:
+
         """
         Write a contents of the :class:`Network` to a touchstone file.
 
         Parameters
         ----------
-        filename : a string, optional
+        filename : a string or Path, optional
             touchstone filename, without extension. if 'None', then
             will use the network's :attr:`name`.
-        dir : string, optional
+        dir : string or Path, optional
             the directory to save the file in.
         write_z0 : boolean
             write impedance information into touchstone as comments,
@@ -2300,6 +2382,26 @@ class Network:
             If None network port impedance is used if possible. If None and
             network port impedance is complex and not equal at all ports and
             frequency points raises ValueError.
+        format_spec_nf_freq : string, optional
+            Any valid format specifying string as given by
+            https://docs.python.org/3/library/string.html#format-string-syntax
+            This specifies the formatting in the resulting touchstone file for the noise data frequency.
+        format_spec_nf_min : string, optional
+            Any valid format specifying string as given by
+            https://docs.python.org/3/library/string.html#format-string-syntax
+            This specifies the formatting in the resulting touchstone file for the minimum NF.
+        format_spec_g_opt_mag : string, optional
+            Any valid format specifying string as given by
+            https://docs.python.org/3/library/string.html#format-string-syntax
+            This specifies the formatting in the resulting touchstone file for the GammaOpt magnitude.
+        format_spec_g_opt_phase : string, optional
+            Any valid format specifying string as given by
+            https://docs.python.org/3/library/string.html#format-string-syntax
+            This specifies the formatting in the resulting touchstone file for the GammaOpt phase.
+        format_spec_rn : string, optional
+            Any valid format specifying string as given by
+            https://docs.python.org/3/library/string.html#format-string-syntax
+            This specifies the formatting in the resulting touchstone file for the noise resistance.
 
         Note
         ----
@@ -2316,8 +2418,8 @@ class Network:
         # according to Touchstone 2.0 spec
         # [no tab, max. 4 coeffs per line, etc.]
 
-        have_complex_ports = npy.any(self.z0.imag != 0)
-        equal_z0 = npy.all(self.z0 == self.z0[0, 0])
+        have_complex_ports = np.any(self.z0.imag != 0)
+        equal_z0 = np.all(self.z0 == self.z0[0, 0])
 
         ntwk = self.copy()
 
@@ -2334,7 +2436,7 @@ class Network:
                     )
             r_ref = ntwk.z0[0, 0]
         elif r_ref is not None:
-            if not npy.isscalar(r_ref):
+            if not np.isscalar(r_ref):
                 raise ValueError('r_ref must be scalar')
             if r_ref.imag != 0:
                 raise ValueError('r_ref must be real')
@@ -2347,22 +2449,25 @@ class Network:
                 raise ValueError('No filename given. Network must have a name, or you must provide a filename')
 
         if get_extn(filename) is None:
+            if isinstance(filename, Path):
+                filename = str(filename.resolve())
+
             filename = filename + '.s%ip' % ntwk.number_of_ports
 
         if dir is not None:
             filename = os.path.join(dir, filename)
 
         # set internal variables according to form
-        form = form.upper()
-        if form == "RI":
+        form = form.lower()
+        if form == "ri":
             formatDic = {"labelA": "Re", "labelB": "Im"}
-            funcA = npy.real
-            funcB = npy.imag
-        elif form == "DB":
+            funcA = np.real
+            funcB = np.imag
+        elif form == "db":
             formatDic = {"labelA": "dB", "labelB": "ang"}
             funcA = mf.complex_2_db
             funcB = mf.complex_2_degree
-        elif form == "MA":
+        elif form == "ma":
             formatDic = {"labelA": "mag", "labelB": "ang"}
             funcA = mf.complex_2_magnitude
             funcB = mf.complex_2_degree
@@ -2396,7 +2501,7 @@ class Network:
             except AttributeError:
                 pass
             if skrf_comment:
-                commented_header += '!Created with skrf (http://scikit-rf.org).\n'
+                commented_header += '! Created with skrf (http://scikit-rf.org).\n'
 
             output.write(commented_header)
 
@@ -2405,8 +2510,9 @@ class Network:
             # exactly this format, to work
             # [HZ/KHZ/MHZ/GHZ] [S/Y/Z/G/H] [MA/DB/RI] [R n]
             if write_z0:
-                output.write('!Data is not renormalized\n')
-                output.write(f'# {ntwk.frequency.unit} S {form} R\n')
+                output.write('! Data is not renormalized\n')
+                output.write(f'! S-parameter uses the {self.s_def} definition\n')
+                output.write(f'# {ntwk.frequency.unit} S {form.upper()} R\n')
             else:
                 # Write "r_ref.real" instead of "r_ref", so we get a real number "a" instead
                 # of a complex number "(a+0j)", which is unsupported by the standard Touchstone
@@ -2415,7 +2521,7 @@ class Network:
                 assert r_ref.imag == 0, "Complex reference impedance is encountered when " \
                                         "generating a standard Touchstone (non-HFSS), this " \
                                         "should never happen in scikit-rf."
-                output.write(f'# {ntwk.frequency.unit} S {form} R {r_ref.real} \n')
+                output.write(f'# {ntwk.frequency.unit} S {form.upper()} R {r_ref.real} \n')
 
             # write ports
             try:
@@ -2474,11 +2580,15 @@ class Network:
 
                 # write noise data if it exists
                 if ntwk.noisy:
+                    output.write("! Noise Data\n! freq\tnf_min_db\tmagGOpt\tdegGOpt\tRn_eff\n")
                     new = ntwk.copy()
                     new.resample(ntwk.f_noise) # only write data from original noise freqs
                     for f, nf, g_opt, rn, z0 in zip(new.f_noise.f_scaled, new.nfmin_db, new.g_opt, new.rn, new.z0):
-                        output.write(f"{f} {nf} {mf.complex_2_magnitude(g_opt)} "
-                                     f"{mf.complex_2_degree(g_opt)} {rn/z0[0].real}\n")
+                        output.write(format_spec_nf_freq.format(f) + ' ' \
+                             + format_spec_nf_min.format(nf) + ' ' \
+                             + format_spec_g_opt_mag.format(mf.complex_2_magnitude(g_opt)) + ' ' \
+                             + format_spec_g_opt_phase.format(mf.complex_2_degree(g_opt)) + ' ' \
+                             + format_spec_rn.format(rn/z0[0].real) + ' ' "\n")
 
             elif ntwk.number_of_ports == 3:
                 # 3-port is written over 3 lines / matrix order
@@ -2545,7 +2655,7 @@ class Network:
             elif return_string is True:
                 return output.getvalue()
 
-    def write(self, file: str = None, *args, **kwargs) -> None:
+    def write(self, file: str | Path = None, *args, **kwargs) -> None:
         r"""
         Write the Network to disk using the :mod:`pickle` module.
 
@@ -2556,7 +2666,7 @@ class Network:
 
         Parameters
         ----------
-        file : str or file-object
+        file : str, Path, or file-object
             filename or a file-object. If left as None then the
             filename will be set to Network.name, if its not None.
             If both are None, ValueError is raised.
@@ -2694,8 +2804,8 @@ class Network:
 
     # interpolation
     def interpolate(self, freq_or_n: Frequency | NumberLike, basis: str = 's',
-                    coords: str = 'cart', f_kwargs: dict = None, return_array: bool = False,
-                    **kwargs) -> Network | npy.ndarray:
+                    coords: CoordT = 'cart', f_kwargs: dict = None, return_array: bool = False,
+                    kind: InterpolKindT | None = None, **kwargs) -> Network | np.ndarray:
         r"""
         Interpolate a Network along frequency axis.
 
@@ -2731,6 +2841,10 @@ class Network:
             return the interpolated array instead of re-assigning it to
             a given attribute
         **kwargs : keyword arguments
+            passed to interpolate method.
+            `freq_cropped` kwarg controls whether to use pre-cropped frequency
+            points for interpolation. Defaults to True.
+
             passed to :func:`scipy.interpolate.interp1d` initializer.
             `kind` controls interpolation type.
 
@@ -2746,7 +2860,11 @@ class Network:
 
         Note
         ----
-        The interpolation coordinate system (`coords`)  makes  a big
+        Frequency cropping is only supported with methods from
+        `scipy.interpolate.interpolate.interp1d`. The 'rational' method does
+        not support frequency cropping.
+
+        The interpolation coordinate system (`coords`)  makes a big
         difference for large amounts of interpolation. polar works well
         for duts with slowly changing magnitude. try them all.
 
@@ -2787,11 +2905,14 @@ class Network:
             f_kwargs = {}
         result = self.copy()
 
-        if kwargs.get('kind', None) == 'rational':
+        is_rational = False
+        freq_cropped = kwargs.pop('freq_cropped', True)
+        if kind == 'rational':
             f_interp = mf.rational_interp
             #Not supported by rational_interp
-            del kwargs['kind']
+            is_rational = True
         else:
+            kwargs["kind"] = kind if kind is not None else "linear"
             f_interp = interp1d
 
         # interpret input
@@ -2816,26 +2937,36 @@ class Network:
         f = self.frequency.f
         f_new = new_frequency.f
 
+        # Pre-cropped the frequency
+        l_idx = max(np.searchsorted(f, f_new[0], side="left") - 8, 0)
+        r_idx = min(np.searchsorted(f, f_new[-1], side="right") + 8, len(f))
+
+        # rational method or prohibit frequency clipping
+        if is_rational or not freq_cropped:
+            l_idx, r_idx = 0, len(f)
+        f_cropped = f[l_idx:r_idx]
+
         # interpolate z0  ( this must happen first, because its needed
         # to compute the basis transform below (like y2s), if basis!='s')
-        if npy.all(self.z0 == self.z0[0]):
+        if np.all(self.z0 == self.z0[0]):
             # If z0 is constant we don't need to interpolate it
             z0_shape = list(self.z0.shape)
             z0_shape[0] = len(f_new)
-            result._z0 = npy.ones(z0_shape) * self.z0[0]
+            result._z0 = np.ones(z0_shape) * self.z0[0]
         else:
-            result._z0 = f_interp(f, self.z0, axis=0, **kwargs)(f_new)
+            result._z0 = f_interp(f_cropped, self.z0[l_idx:r_idx], axis=0, **kwargs)(f_new)
 
-        # interpolate  parameter for a given basis
-        x = getattr(self, basis)
+        # interpolate parameter for a given basis
+        x: np.ndarray = getattr(self, basis)
+        x_cropped = x[l_idx:r_idx]
         if coords == 'cart':
-            x_new = f_interp(f, x, axis=0, **kwargs)(f_new)
+            x_new = f_interp(f_cropped, x_cropped, axis=0, **kwargs)(f_new)
         elif coords == 'polar':
-            rad = npy.unwrap(npy.angle(x), axis=0)
-            mag = npy.abs(x)
-            interp_rad = f_interp(f, rad, axis=0, **kwargs)
-            interp_mag = f_interp(f, mag, axis=0, **kwargs)
-            x_new = interp_mag(f_new) * npy.exp(1j * interp_rad(f_new))
+            rad = np.unwrap(np.angle(x_cropped), axis=0)
+            mag = np.abs(x_cropped)
+            interp_rad = f_interp(f_cropped, rad, axis=0, **kwargs)
+            interp_mag = f_interp(f_cropped, mag, axis=0, **kwargs)
+            x_new = interp_mag(f_new) * np.exp(1j * interp_rad(f_new))
         else:
             raise ValueError(f'Unknown coords {coords}')
 
@@ -2898,8 +3029,8 @@ class Network:
     ##convenience
     resample = interpolate_self
 
-    def extrapolate_to_dc(self, points: int = None, dc_sparam: NumberLike = None,
-                          kind: str = 'cubic', coords: str = 'cart',
+    def extrapolate_to_dc(self, points: int = None, dc_sparam: NumberLike | None = None,
+                          kind: InterpolKindT = 'cubic', coords: CoordT = 'cart',
                           **kwargs) -> Network:
         """
         Extrapolate S-parameters down to 0 Hz and interpolate to uniform spacing.
@@ -2916,7 +3047,7 @@ class Network:
             Number of frequency points to be used in interpolation.
             If None number of points is calculated based on the frequency step size
             and spacing between 0 Hz and first measured frequency point.
-        dc_sparam : class:`npy.ndarray` or None
+        dc_sparam : class:`np.ndarray` or None
             NxN S-parameters matrix at 0 Hz.
             If None S-parameters at 0 Hz are determined by linear extrapolation.
         kind : str or int, default is 'cubic'
@@ -2959,22 +3090,22 @@ class Network:
             #TODO: Option to enforce passivity
             x = result.s[:2]
             f = result.frequency.f[:2]
-            rad = npy.unwrap(npy.angle(x), axis=0)
-            mag = npy.abs(x)
+            rad = np.unwrap(np.angle(x), axis=0)
+            mag = np.abs(x)
             interp_rad = interp1d(f, rad, axis=0, fill_value='extrapolate')
             interp_mag = interp1d(f, mag, axis=0, fill_value='extrapolate')
-            dc_sparam = interp_mag(0) * npy.exp(1j * interp_rad(0))
+            dc_sparam = interp_mag(0) * np.exp(1j * interp_rad(0))
         else:
             #Make numpy array if argument was list
-            dc_sparam = npy.array(dc_sparam)
+            dc_sparam = np.array(dc_sparam)
 
-        result.s = npy.insert(result.s, 0, dc_sparam, axis=0)
-        result.frequency._f = npy.insert(result.frequency.f, 0, 0)
-        result.z0 = npy.insert(result.z0, 0, result.z0[0], axis=0)
+        result.s = np.insert(result.s, 0, dc_sparam, axis=0)
+        result.frequency._f = np.insert(result.frequency.f, 0, 0)
+        result.z0 = np.insert(result.z0, 0, result.z0[0], axis=0)
 
         if result.noisy:
-            result.noise = npy.insert(result.noise, 0, 0, axis=0)
-            result.noise_freq._f = npy.insert(result.noise_freq.f, 0, 0)
+            result.noise = np.insert(result.noise, 0, 0, axis=0)
+            result.noise_freq._f = np.insert(result.noise_freq.f, 0, 0)
 
         new_f = Frequency(0, result.frequency.f_scaled[-1], points,
                 unit=result.frequency.unit)
@@ -3045,9 +3176,9 @@ class Network:
 
         """
         if f_start is None:
-            f_start = -npy.inf
+            f_start = -np.inf
         if f_stop is None:
-            f_stop = npy.inf
+            f_stop = np.inf
 
         if f_stop<f_start:
             raise ValueError(f"`f_stop` was {f_stop}, which was smaller than `f_start`, which was {f_start}")
@@ -3166,7 +3297,7 @@ class Network:
         out.flip()
         return out
 
-    def renormalize(self, z_new: NumberLike, s_def: str = None) -> None:
+    def renormalize(self, z_new: NumberLike, s_def: SdefT | None = None) -> None:
         """
         Renormalize s-parameter matrix given a new port impedances.
 
@@ -3188,8 +3319,8 @@ class Network:
         renormalize_s
         fix_z0_shape
         """
-        # cast any array like type (tuple, list) to a npy.array
-        z_new = npy.array(z_new, dtype=complex)
+        # cast any array like type (tuple, list) to a np.array
+        z_new = np.array(z_new, dtype=complex)
         # make sure the z_new shape can be compared with self.z0
         z_new = fix_z0_shape(z_new, self.frequency.npoints, self.nports)
         if s_def is None:
@@ -3199,7 +3330,7 @@ class Network:
         # We need to renormalize if z_new is different from z0
         # or s_def is different and there is at least one complex port.
         need_to_renorm = False
-        if npy.any(self.z0 != z_new):
+        if np.any(self.z0 != z_new):
             need_to_renorm = True
         if s_def != self.s_def and (self.z0.imag != 0).any():
             need_to_renorm = True
@@ -3214,7 +3345,7 @@ class Network:
         self.s_def = s_def
         self.z0 = z_new
 
-    def renumber(self, from_ports: Sequence[int], to_ports: Sequence[int]) -> None:
+    def renumber(self, from_ports: Sequence[int], to_ports: Sequence[int], only_z0: bool = False) -> None:
         """
         Renumber ports of a Network (inplace).
 
@@ -3224,6 +3355,10 @@ class Network:
             List of port indices to change. Size between 1 and N_ports.
         to_ports : list-like
             List of desired port indices. Size between 1 and N_ports.
+        only_z0 : bool
+            If true only z0 is renumbered, s-parameters are not affected.
+            This should only be used after executing the "connect_s" method
+            which keeps the port index where you expect it to be.
 
         NB : from_ports and to_ports must have same size.
 
@@ -3240,52 +3375,73 @@ class Network:
         reorganized. Dummy reference impedances are set only to follow more
         easily the renumbering.
 
-        >>> f = rf.Frequency(1, 1, 1)
-        >>> s = np.ones((1, 3, 3))
+        >>> f = rf.Frequency(1, 1, 1, 'hz')
+        >>> s = np.arange(9).reshape(1, 3, 3)
         >>> z0 = [10, 20, 30]
         >>> ntw = rf.Network(frequency=f, s=s, z0=z0)  # our OEM Network
 
         In picture, we have::
 
-            Order in          Original Order
-            skrf.Network
-                        ┌───────────────────┐
-                        │       OEM         │
-                        │                   │
-            0   ────────┤  A  (10 Ω)        │
-                        │                   │
-                        │                   │
-            1   ────────┤  B  (20 Ω)        │
-                        │                   │
-                        │                   │
-            2   ────────┤  C  (30 Ω)        │
-                        │                   │
-                        └───────────────────┘
+            Order in          Original Order         Scatter Parameters
+            skrf.Network                             0      1      2
+                        ┌───────────────────┐      ┌──────────────────────┐
+                        │       OEM         │      │                      │
+                        │                   │      │                      │
+            0   ────────┤  A  (10 Ω)        │      ┤ 0.+0.j 1.+0.j 2.+0.j │
+                        │                   │      │                      │
+                        │                   │      │                      │
+            1   ────────┤  B  (20 Ω)        │      ┤ 3.+0.j 4.+0.j 5.+0.j │
+                        │                   │      │                      │
+                        │                   │      │                      │
+            2   ────────┤  C  (30 Ω)        │      ┤ 6.+0.j 7.+0.j 8.+0.j │
+                        │                   │      │                      │
+                        └───────────────────┘      └──────────────────────┘
 
         While after renumbering
 
-        >>> ntw.renumber([0,1,2], [1, 2, 0])
-
+        >>> ntw.renumber([0, 1, 2], [1, 2, 0])
 
         we now have::
 
-            Order in          Original Order
-            skrf.Network
-                        ┌───────────────────┐
-                        │       OEM         │
-                        │                   │
-            1   ────────┤  A  (10 Ω)        │
-                        │                   │
-                        │                   │
-            2   ────────┤  B  (20 Ω)        │
-                        │                   │
-                        │                   │
-            0   ────────┤  C  (30 Ω)        │
-                        │                   │
-                        └───────────────────┘
+            Order in                                 Scatter Parameters
+            skrf.Network                             0      1      2
+                        ┌───────────────────┐      ┌──────────────────────┐
+                        │       OEM         │      │                      │
+                        │                   │      │                      │
+            0   ────────┤  C  (30 Ω)        │      ┤ 8.+0.j 6.+0.j 7.+0.j │
+                        │                   │      │                      │
+                        │                   │      │                      │
+            1   ────────┤  A  (10 Ω)        │      ┤ 2.+0.j 0.+0.j 1.+0.j │
+                        │                   │      │                      │
+                        │                   │      │                      │
+            2   ────────┤  B  (20 Ω)        │      ┤ 5.+0.j 3.+0.j 4.+0.j │
+                        │                   │      │                      │
+                        └───────────────────┘      └──────────────────────┘
 
         **Other examples:**
 
+        Reorganized only the reference impedance of the ports, while keeping
+        the order of the scattering parameters is also supported. This is
+        beneficial in some special cases.
+
+        >>> ntw.renumber([1, 2, 0], [0, 1, 2], only_z0=True)
+
+        we now have::
+
+            Order in                                 Scatter Parameters
+            skrf.Network                             0      1      2
+                        ┌───────────────────┐      ┌──────────────────────┐
+                        │       OEM         │      │                      │
+                        │                   │      │                      │
+            0   ────────┤  A  (10 Ω)        │      ┤ 8.+0.j 6.+0.j 7.+0.j │
+                        │                   │      │                      │
+                        │                   │      │                      │
+            1   ────────┤  B  (20 Ω)        │      ┤ 2.+0.j 0.+0.j 1.+0.j │
+                        │                   │      │                      │
+                        │                   │      │                      │
+            2   ────────┤  C  (30 Ω)        │      ┤ 5.+0.j 3.+0.j 4.+0.j │
+                        │                   │      │                      │
+                        └───────────────────┘      └──────────────────────┘
 
         To flip the ports of a 2-port network 'foo':
 
@@ -3306,16 +3462,21 @@ class Network:
         flipped
 
         """
-        from_ports = npy.array(from_ports)
-        to_ports = npy.array(to_ports)
-        if len(npy.unique(from_ports)) != len(from_ports):
+        from_ports = np.array(from_ports)
+        to_ports = np.array(to_ports)
+        if len(np.unique(from_ports)) != len(from_ports):
             raise ValueError('an index can appear at most once in from_ports or to_ports')
-        if any(npy.unique(from_ports) != npy.unique(to_ports)):
+        if any(np.unique(from_ports) != np.unique(to_ports)):
             raise ValueError('from_ports and to_ports must have the same set of indices')
 
-        self.s[:, to_ports, :] = self.s[:, from_ports, :]  # renumber rows
-        self.s[:, :, to_ports] = self.s[:, :, from_ports]  # renumber columns
+        if not only_z0:
+            self.s[:, to_ports, :] = self.s[:, from_ports, :]  # renumber rows
+            self.s[:, :, to_ports] = self.s[:, :, from_ports]  # renumber columns
         self.z0[:, to_ports] = self.z0[:, from_ports]
+        if self.port_names is not None:
+            _port_names = np.array(self.port_names)
+            _port_names[to_ports] = _port_names[from_ports]
+            self.port_names = _port_names.tolist()
 
     def renumbered(self, from_ports: Sequence[int], to_ports: Sequence[int]) -> Network:
         """
@@ -3353,7 +3514,7 @@ class Network:
         if unit == 'deg':
             theta = mf.degree_2_radian(theta )
 
-        self.s = self.s * npy.exp(-1j*theta)
+        self.s = self.s * np.exp(-1j*theta)
 
     def delay(self, d: float, unit: str = 'deg', port: int = 0, media: Any = None, **kw) -> Network:
         """
@@ -3446,14 +3607,14 @@ class Network:
         else:
             window = get_window(window, len(self))
 
-        window = window.reshape(-1, 1, 1) * npy.ones((len(self),
+        window = window.reshape(-1, 1, 1) * np.ones((len(self),
                                                       self.nports,
                                                       self.nports))
         windowed = self * window
         if normalize:
             # normalize the s-parameters to account for power lost in windowing
-            windowed.s = windowed.s * npy.sum(self.s_mag, axis=0) / \
-                         npy.sum(windowed.s_mag, axis=0)
+            windowed.s = windowed.s * np.sum(self.s_mag, axis=0) / \
+                         np.sum(windowed.s_mag, axis=0)
 
         return windowed
 
@@ -3493,7 +3654,7 @@ class Network:
 
         phase = (self.s_deg + phase_rv)
         mag = self.s_mag + mag_rv
-        self.s = mag * npy.exp(1j * npy.pi / 180. * phase)
+        self.s = mag * np.exp(1j * np.pi / 180. * phase)
 
     def add_noise_polar_flatband(self, mag_dev: float, phase_dev: float, **kwargs) -> None:
         """
@@ -3513,7 +3674,7 @@ class Network:
 
         phase = (self.s_deg + phase_rv)
         mag = self.s_mag + mag_rv
-        self.s = mag * npy.exp(1j * npy.pi / 180. * phase)
+        self.s = mag * np.exp(1j * np.pi / 180. * phase)
 
     def multiply_noise(self, mag_dev: float, phase_dev: float, **kwargs) -> None:
         """
@@ -3534,7 +3695,7 @@ class Network:
             size=self.s.shape)
         mag_rv = stats.norm(loc=1, scale=mag_dev).rvs( \
             size=self.s.shape)
-        self.s = mag_rv * npy.exp(1j * npy.pi / 180. * phase_rv) * self.s
+        self.s = mag_rv * np.exp(1j * np.pi / 180. * phase_rv) * self.s
 
     def nudge(self, amount: float = 1e-12) -> Network:
         """
@@ -3595,7 +3756,7 @@ class Network:
         """
         ntwkB = self.copy()
         p = getattr(self, attr)
-        ntwkB.s = npy.r_[[func(p[k, :, :], *args, **kwargs) \
+        ntwkB.s = np.r_[[func(p[k, :, :], *args, **kwargs) \
                           for k in range(len(p))]]
         return ntwkB
 
@@ -3629,13 +3790,13 @@ class Network:
         reverse = getattr(self, f"s{n}_{m}")
         if normalize:
             denom = forward * reverse
-            denom.s = npy.sqrt(denom.s)
+            denom.s = np.sqrt(denom.s)
             return (forward - reverse) / denom
         else:
             return (forward - reverse)
 
     # generalized mixed mode transformations
-    def se2gmm(self, p: int, z0_mm: npy.ndarray = None, s_def : str = None) -> None:
+    def se2gmm(self, p: int, z0_mm: np.ndarray = None, s_def : str = None) -> None:
         """
         Transform network from single ended parameters to generalized mixed mode parameters [#]_.
 
@@ -3782,12 +3943,12 @@ class Network:
             # Only set mixed mode ports
             _z0_mm = self.z0.copy()
             shape = [self.z0.shape[0], 2 * p]
-            z0_p = npy.broadcast_to(z0_mm, shape)
+            z0_p = np.broadcast_to(z0_mm, shape)
             _z0_mm[:,:2*p] = z0_p
             z0_mm = _z0_mm
         Xi_tilde_11, Xi_tilde_12, Xi_tilde_21, Xi_tilde_22 = self._Xi_tilde(p, self.z0, z0_mm, s_def)
-        A = Xi_tilde_21 + npy.einsum('...ij,...jk->...ik', Xi_tilde_22, self.s)
-        B = Xi_tilde_11 + npy.einsum('...ij,...jk->...ik', Xi_tilde_12, self.s)
+        A = Xi_tilde_21 + np.einsum('...ij,...jk->...ik', Xi_tilde_22, self.s)
+        B = Xi_tilde_11 + np.einsum('...ij,...jk->...ik', Xi_tilde_12, self.s)
         self.s = mf.rsolve(B, A)
         self.z0 = z0_mm
 
@@ -3916,36 +4077,36 @@ class Network:
             # Only set mixed mode ports
             _z0_se = self.z0.copy()
             shape = [self.z0.shape[0], 2 * p]
-            z0_p = npy.broadcast_to(z0_se, shape)
+            z0_p = np.broadcast_to(z0_se, shape)
             _z0_se[:,:2*p] = z0_p
             z0_se = _z0_se
         Xi_tilde_11, Xi_tilde_12, Xi_tilde_21, Xi_tilde_22 = self._Xi_tilde(p, z0_se, self.z0, s_def)
-        A = Xi_tilde_22 - npy.einsum('...ij,...jk->...ik', self.s, Xi_tilde_12)
+        A = Xi_tilde_22 - np.einsum('...ij,...jk->...ik', self.s, Xi_tilde_12)
         # Note that B sign is incorrect in the paper. Inverted B here gives the
         # correct result.
-        B = -Xi_tilde_21 + npy.einsum('...ij,...jk->...ik', self.s, Xi_tilde_11)
-        self.s = npy.linalg.solve(A, B)  # (35)
+        B = -Xi_tilde_21 + np.einsum('...ij,...jk->...ik', self.s, Xi_tilde_11)
+        self.s = np.linalg.solve(A, B)  # (35)
         self.z0 = z0_se
 
     # generalized mixed mode supplement functions
-    _T = npy.array([[1, 0, -1, 0], [0, 0.5, 0, -0.5], [0.5, 0, 0.5, 0], [0, 1, 0, 1]])  # (5)
+    _T = np.array([[1, 0, -1, 0], [0, 0.5, 0, -0.5], [0.5, 0, 0.5, 0], [0, 1, 0, 1]])  # (5)
 
-    def _m(self, z0: npy.ndarray, s_def : str) -> npy.ndarray:
+    def _m(self, z0: np.ndarray, s_def : str) -> np.ndarray:
         if s_def == 'pseudo':
-            scaling = npy.sqrt(z0.real) / (2 * npy.abs(z0))
-            Z = npy.ones((z0.shape[0], 2, 2), dtype=npy.complex128)
+            scaling = np.sqrt(z0.real) / (2 * np.abs(z0))
+            Z = np.ones((z0.shape[0], 2, 2), dtype=np.complex128)
             Z[:, 0, 1] = z0
             Z[:, 1, 1] = -z0
-            return scaling[:, npy.newaxis, npy.newaxis] * Z
+            return scaling[:, np.newaxis, np.newaxis] * Z
         elif s_def == 'power':
-            scaling = 1 / (2 * npy.sqrt(z0.real))
-            Z = npy.ones((z0.shape[0], 2, 2), dtype=npy.complex128)
+            scaling = 1 / (2 * np.sqrt(z0.real))
+            Z = np.ones((z0.shape[0], 2, 2), dtype=np.complex128)
             Z[:, 0, 1] = z0
             Z[:, 1, 1] = -z0.conj()
-            return scaling[:, npy.newaxis, npy.newaxis] * Z
+            return scaling[:, np.newaxis, np.newaxis] * Z
         elif s_def == 'traveling':
-            Z = npy.ones((z0.shape[0], 2, 2), dtype=npy.complex128)
-            sqrtz0 = npy.sqrt(z0)
+            Z = np.ones((z0.shape[0], 2, 2), dtype=np.complex128)
+            sqrtz0 = np.sqrt(z0)
             Z[:, 0, 0] = 1 / sqrtz0
             Z[:, 0, 1] = sqrtz0
             Z[:, 1, 0] = 1 / sqrtz0
@@ -3954,14 +4115,14 @@ class Network:
         else:
             raise ValueError('Unknown s_def')
 
-    def _M(self, j: int, k: int, z0_se: npy.ndarray, s_def : str) -> npy.ndarray:  # (14)
-        M = npy.zeros((self.f.shape[0], 4, 4), dtype=npy.complex128)
+    def _M(self, j: int, k: int, z0_se: np.ndarray, s_def : str) -> np.ndarray:  # (14)
+        M = np.zeros((self.f.shape[0], 4, 4), dtype=np.complex128)
         M[:, :2, :2] = self._m(z0_se[:, j], s_def)
         M[:, 2:, 2:] = self._m(z0_se[:, k], s_def)
         return M
 
-    def _M_circle(self, l: int, p: int, z0_mm: npy.ndarray, s_def : str) -> npy.ndarray:  # (12)
-        M = npy.zeros((self.f.shape[0], 4, 4), dtype=npy.complex128)
+    def _M_circle(self, l: int, p: int, z0_mm: np.ndarray, s_def : str) -> np.ndarray:  # (12)
+        M = np.zeros((self.f.shape[0], 4, 4), dtype=np.complex128)
         M[:, :2, :2] = self._m(z0_mm[:, l], s_def)  # differential mode impedance of port pair
         M[:, 2:, 2:] = self._m(z0_mm[:, p + l], s_def)  # common mode impedance of port pair
         return M
@@ -3971,59 +4132,67 @@ class Network:
            k: int ,
            l: int,
            p: int,
-           z0_se: npy.ndarray,
-           z0_mm: npy.ndarray,
-           s_def : str) -> npy.ndarray:  # (15)
+           z0_se: np.ndarray,
+           z0_mm: np.ndarray,
+           s_def : str) -> np.ndarray:  # (15)
         # matrix multiplication elementwise for each frequency
-        return npy.einsum('...ij,...jk->...ik',
+        return np.einsum('...ij,...jk->...ik',
                           self._M_circle(l, p, z0_mm, s_def).dot(self._T),
-                          npy.linalg.inv(self._M(j, k, z0_se, s_def)))
-    def _P(self, p: int) -> npy.ndarray:  # (27) (28)
+                          np.linalg.inv(self._M(j, k, z0_se, s_def)))
+    def _P(self, p: int) -> np.ndarray:  # (27) (28)
         n = self.nports
 
-        Pda = npy.zeros((p, 2 * n), dtype=bool)
-        Pdb = npy.zeros((p, 2 * n), dtype=bool)
-        Pca = npy.zeros((p, 2 * n), dtype=bool)
-        Pcb = npy.zeros((p, 2 * n), dtype=bool)
-        Pa = npy.zeros((n - 2 * p, 2 * n), dtype=bool)
-        Pb = npy.zeros((n - 2 * p, 2 * n), dtype=bool)
-        for l in npy.arange(p):
+        Pda = np.zeros((p, 2 * n), dtype=bool)
+        Pdb = np.zeros((p, 2 * n), dtype=bool)
+        Pca = np.zeros((p, 2 * n), dtype=bool)
+        Pcb = np.zeros((p, 2 * n), dtype=bool)
+        Pa = np.zeros((n - 2 * p, 2 * n), dtype=bool)
+        Pb = np.zeros((n - 2 * p, 2 * n), dtype=bool)
+        for l in np.arange(p):
             Pda[l, 4 * (l + 1) - 3 - 1] = True
             Pca[l, 4 * (l + 1) - 1 - 1] = True
             Pdb[l, 4 * (l + 1) - 2 - 1] = True
             Pcb[l, 4 * (l + 1) - 1] = True
-        for l in npy.arange(n - 2 * p):
+        for l in np.arange(n - 2 * p):
             Pa[l, 4 * p + 2 * (l + 1) - 1 - 1] = True
             Pb[l, 4 * p + 2 * (l + 1) - 1] = True
-        return npy.concatenate((Pda, Pca, Pa, Pdb, Pcb, Pb))
+        return np.concatenate((Pda, Pca, Pa, Pdb, Pcb, Pb))
 
-    def _Q(self) -> npy.ndarray:  # (29) error corrected
+    def _Q(self) -> np.ndarray:  # (29) error corrected
         n = self.nports
 
-        Qa = npy.zeros((n, 2 * n), dtype=bool)
-        Qb = npy.zeros((n, 2 * n), dtype=bool)
-        for l in npy.arange(n):
+        Qa = np.zeros((n, 2 * n), dtype=bool)
+        Qb = np.zeros((n, 2 * n), dtype=bool)
+        for l in np.arange(n):
             Qa[l, 2 * (l + 1) - 1 - 1] = True
             Qb[l, 2 * (l + 1) - 1] = True
-        return npy.concatenate((Qa, Qb))
+        return np.concatenate((Qa, Qb))
 
-    def _Xi(self, p: int, z0_se: npy.ndarray, z0_mm: npy.ndarray, s_def : str) -> npy.ndarray:  # (24)
+    def _Xi(self, p: int, z0_se: np.ndarray, z0_mm: np.ndarray, s_def : str) -> np.ndarray:  # (24)
         n = self.nports
-        Xi = npy.ones(self.f.shape[0])[:, npy.newaxis, npy.newaxis] * npy.eye(2 * n, dtype=npy.complex128)
-        for l in npy.arange(p):
+        Xi = np.ones(self.f.shape[0])[:, np.newaxis, np.newaxis] * np.eye(2 * n, dtype=np.complex128)
+        for l in np.arange(p):
             Xi[:, 4 * l:4 * l + 4, 4 * l:4 * l + 4] = self._X(l * 2, l * 2 + 1, l, p, z0_se, z0_mm, s_def)
         return Xi
 
-    def _Xi_tilde(self, p: int, z0_se: npy.ndarray, z0_mm: npy.ndarray, s_def : str) -> npy.ndarray:  # (31)
+    def _Xi_tilde(
+        self, p: int, z0_se: np.ndarray, z0_mm: np.ndarray, s_def: SdefT
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:  # (31)
         n = self.nports
-        P = npy.ones(self.f.shape[0])[:, npy.newaxis, npy.newaxis] * self._P(p)
-        QT = npy.ones(self.f.shape[0])[:, npy.newaxis, npy.newaxis] * self._Q().T
+        P = np.ones(self.f.shape[0])[:, np.newaxis, np.newaxis] * self._P(p)
+        QT = np.ones(self.f.shape[0])[:, np.newaxis, np.newaxis] * self._Q().T
         Xi = self._Xi(p, z0_se, z0_mm, s_def)
-        Xi_tilde = npy.einsum('...ij,...jk->...ik', npy.einsum('...ij,...jk->...ik', P, Xi), QT)
+        Xi_tilde: np.ndarray = np.einsum("...ij,...jk->...ik", np.einsum("...ij,...jk->...ik", P, Xi), QT)
         return Xi_tilde[:, :n, :n], Xi_tilde[:, :n, n:], Xi_tilde[:, n:, :n], Xi_tilde[:, n:, n:]
 
-    def impulse_response(self, window: str = 'hamming', n: int = None, pad: int = 1000,
-                        bandpass: bool = None, squeeze: bool = True) -> tuple[npy.ndarray, npy.ndarray]:
+    def impulse_response(
+        self,
+        window: str = "hamming",
+        n: int | None = None,
+        pad: int = 0,
+        bandpass: bool | None = None,
+        squeeze: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Calculate time-domain impulse response of one-port.
 
         First frequency must be 0 Hz for the transformation to be accurate and
@@ -4039,30 +4208,30 @@ class Network:
         Parameters
         ----------
         window : string
-                FFT windowing function.
+                FFT windowing function. (Default is 'hamming')
         n : int
                 Length of impulse response output.
                 If n is not specified, 2 * (m - 1) points are used,
-                where m = len(self) + pad
+                where m = len(self) + pad. (Default is None)
         pad : int
                 Number of zeros to add as padding for FFT.
-                Adding more zeros improves accuracy of peaks.
+                Adding more zeros improves accuracy of peaks. (Default is 0)
         bandpass : bool or None
                 If False window function is center on 0 Hz.
                 If True full window is used and low frequencies are attenuated.
                 If None value is determined automatically based on if the
-                frequency vector begins from 0.
+                frequency vector begins from 0. (Default is None)
         squeeze: bool
                 Squeeze impulse response to one dimension,
                 if a oneport gets transformed.
                 Has no effect when transforming a multiport.
-                Default = True
+                (Default is True)
 
         Returns
         -------
-        t : class:`npy.ndarray`
+        t : class:`np.ndarray`
             Time vector
-        y : class:`npy.ndarray`
+        y : class:`np.ndarray`
             Impulse response
 
         See Also
@@ -4070,33 +4239,30 @@ class Network:
             step_response
             extrapolate_to_dc
         """
-        if n is None:
-            # Use zero-padding specification. Note that this does not allow n odd.
-            n = 2 * (self.frequency.npoints + pad - 1)
+        if bandpass is None:
+            bandpass = self.f[0] != 0
 
-        fstep = self.frequency.step
-        if n % 2 == 0:
-            t = npy.fft.ifftshift(npy.fft.fftfreq(n, fstep))
-        else:
-            t = npy.fft.ifftshift(npy.fft.fftfreq(n+1, fstep))[1:]
-        if bandpass in (True, False):
-            center_to_dc = not bandpass
-        else:
-            center_to_dc = None
+        t = self.frequency._t_padded(pad=pad, n=n, bandpass=bandpass)
+        n = len(t)
+
         if window is not None:
-            w = self.windowed(window=window, normalize=False, center_to_dc=center_to_dc)
+            w = self.windowed(window=window, normalize=False, center_to_dc=not bandpass)
         else:
             w = self
 
-        ir = mf.irfft(w.s, n=n)
+        if bandpass:
+            ir = np.fft.fftshift(np.fft.ifft(w.s, axis=0, n=n), axes=0)
+        else:
+            ir = np.fft.fftshift(np.fft.irfft(w.s, axis=0, n=n), axes=0)
+
         if squeeze:
             ir = ir.squeeze()
 
         return t, ir
 
     def step_response(
-            self, window: str = 'hamming', n: int = None, pad: int = 1000, squeeze: bool = True
-            ) -> tuple[npy.ndarray, npy.ndarray]:
+        self, window: str = "hamming", n: int | None = None, pad: int = 0, squeeze: bool = True
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Calculate time-domain step response of one-port.
 
         First frequency must be 0 Hz for the transformation to be accurate and
@@ -4106,29 +4272,31 @@ class Network:
         uniform frequency spacing.
 
         Y-axis is the reflection coefficient.
+        `step_resonse` is equal to the cumulative trapezoid integration of the
+        `impulse_response` function.
 
         Parameters
         ----------
         window : string
-                FFT windowing function.
+                FFT windowing function. (Default is 'hamming')
         n : int
                 Length of step response output.
                 If n is not specified, 2 * (m - 1) points are used,
-                where m = len(self) + pad
+                where m = len(self) + pad. (Default is None)
         pad : int
                 Number of zeros to add as padding for FFT.
-                Adding more zeros improves accuracy of peaks.
+                Adding more zeros improves accuracy of peaks. (Default is 0)
         squeeze: bool
                 Squeeze step response to one dimension,
                 if a oneport gets transformed.
                 Has no effect when transforming a multiport.
-                Default = True
+                (Default is True)
 
         Returns
         -------
-        t : class:`npy.ndarray`
+        t : class:`np.ndarray`
             Time vector
-        y : class:`npy.ndarray`
+        y : class:`np.ndarray`
             Step response
 
         Raises
@@ -4155,10 +4323,10 @@ class Network:
             )
 
         t, y = self.impulse_response(window=window, n=n, pad=pad, bandpass=False, squeeze=squeeze)
-        return t, npy.cumsum(y, axis=0)
+        return t, cumulative_trapezoid(y, initial=0, axis=0)
 
     # Network Active s/z/y/vswr parameters
-    def s_active(self, a: npy.ndarray) -> npy.ndarray:
+    def s_active(self, a: np.ndarray) -> np.ndarray:
         r"""
         Returns the active s-parameters of the network for a defined wave excitation a.
 
@@ -4199,7 +4367,7 @@ class Network:
         """
         return s2s_active(self.s, a)
 
-    def z_active(self, a: npy.ndarray) -> npy.ndarray:
+    def z_active(self, a: np.ndarray) -> np.ndarray:
         r"""
         Return the active Z-parameters of the network for a defined wave excitation a.
 
@@ -4230,7 +4398,7 @@ class Network:
         """
         return s2z_active(self.s, self.z0, a)
 
-    def y_active(self, a: npy.ndarray) -> npy.ndarray:
+    def y_active(self, a: np.ndarray) -> np.ndarray:
         r"""
         Return the active Y-parameters of the network for a defined wave excitation a.
 
@@ -4261,7 +4429,7 @@ class Network:
         """
         return s2y_active(self.s, self.z0, a)
 
-    def vswr_active(self, a: npy.ndarray) -> npy.ndarray:
+    def vswr_active(self, a: np.ndarray) -> np.ndarray:
         r"""
         Return the active VSWR of the network for a defined wave excitation a.
 
@@ -4291,7 +4459,7 @@ class Network:
         """
         return s2vswr_active(self.s, a)
 
-    def stability_circle(self, target_port: int, npoints: int = 181) -> npy.ndarray:
+    def stability_circle(self, target_port: int, npoints: int = 181) -> np.ndarray:
         r"""
         Returns loci of stability circles for a given port (0 or 1). The network must have two ports.
         The center and radius of the load (here target_port=1) stability circle are calculated by the following equation
@@ -4354,11 +4522,12 @@ class Network:
 
         References
         ----------
-        ..  [#] David. M. Pozar, "Microwave Engineering, Fource Edition," Wiley, p. 566, 2011.
+        ..  [#] David. M. Pozar, "Microwave Engineering, Fourth Edition," Wiley, p. 566, 2011.
 
         See Also
         --------
         gain_circle
+        nf_circle
         stability
 
         """
@@ -4375,29 +4544,29 @@ class Network:
         # Calculate the center and radius of the stability circle
         if target_port == 1:
             sc_center = ((self.s[:, 1, 1] - self.s[:, 0, 0].conjugate() * D).conjugate()
-                / (npy.abs(self.s[:, 1, 1]) ** 2 - npy.abs(D) ** 2))
-            sc_radius = npy.abs(self.s[:, 0, 1]  * self.s[:, 1, 0]
-                / (npy.abs(self.s[:, 1, 1] ) ** 2 - npy.abs(D) ** 2))
+                / (np.abs(self.s[:, 1, 1]) ** 2 - np.abs(D) ** 2))
+            sc_radius = np.abs(self.s[:, 0, 1]  * self.s[:, 1, 0]
+                / (np.abs(self.s[:, 1, 1] ) ** 2 - np.abs(D) ** 2))
         elif target_port == 0:
             sc_center = ((self.s[:, 0, 0] - self.s[:, 1, 1].conjugate() * D).conjugate()
-                / (npy.abs(self.s[:, 0, 0]) ** 2 - npy.abs(D) ** 2))
-            sc_radius = npy.abs(self.s[:, 0, 1]  * self.s[:, 1, 0]
-                / (npy.abs(self.s[:, 0, 0] ) ** 2 - npy.abs(D) ** 2))
+                / (np.abs(self.s[:, 0, 0]) ** 2 - np.abs(D) ** 2))
+            sc_radius = np.abs(self.s[:, 0, 1]  * self.s[:, 1, 0]
+                / (np.abs(self.s[:, 0, 0] ) ** 2 - np.abs(D) ** 2))
         else:
             raise ValueError("Invalid target_port. Specify 0 or 1.")
 
         # Generate theta values for the points on the circle
-        theta = npy.linspace(0, 2 * npy.pi, npoints)
+        theta = np.linspace(0, 2 * np.pi, npoints)
 
         # Calculate real and imaginary parts of points on the load stability circle
-        sc_real = npy.outer(sc_center.real, npy.ones(npoints)) + npy.outer(sc_radius, npy.cos(theta))
-        sc_imag = npy.outer(sc_center.imag, npy.ones(npoints)) + npy.outer(sc_radius, npy.sin(theta))
+        sc_real = np.outer(sc_center.real, np.ones(npoints)) + np.outer(sc_radius, np.cos(theta))
+        sc_imag = np.outer(sc_center.imag, np.ones(npoints)) + np.outer(sc_radius, np.sin(theta))
 
         # Combine real and imaginary parts to create the load stability circle
         sc = (sc_real + 1j * sc_imag).T
         return sc
 
-    def gain_circle(self, target_port: int, gain: float, npoints: int = 181) -> npy.ndarray:
+    def gain_circle(self, target_port: int, gain: float, npoints: int = 181) -> np.ndarray:
         r"""
         Returns loci of gain circles for a given port (0 or 1) and a specified gain. The network must have two ports.
         The center and radius of the source (here target_port=0) gain circle are calculated by the following equations
@@ -4469,12 +4638,13 @@ class Network:
 
         References
         ----------
-        ..  [#] David. M. Pozar, "Microwave Engineering, Fource Edition," Wiley, p. 576, 2011.
+        ..  [#] David. M. Pozar, "Microwave Engineering, Fourth Edition," Wiley, p. 576, 2011.
         ..  [#] https://www.allaboutcircuits.com/technical-articles/designing-a-unilateral-rf-amplifier-for-a-specified-gain/
 
         See Also
         --------
         stability_circle
+        nf_circle
         max_gain : Maximum available and stable power gain
         max_stable_gain : Maximum stable power gain
         unilateral_gain : Mason's unilateral power gain
@@ -4495,25 +4665,124 @@ class Network:
         else:
             raise ValueError("Invalid target_port. Specify 0 or 1.")
 
-        gain_factor = mf.db10_2_mag(gain) * (1 - npy.abs(reflection) ** 2)
-        if npy.any(gain_factor > 1):
+        gain_factor = mf.db10_2_mag(gain) * (1 - np.abs(reflection) ** 2)
+        if np.any(gain_factor > 1):
             warnings.warn("The specified gain is greater than the maximum gain achievable by the matching network. "
                           "Specify a smaller gain.", RuntimeWarning, stacklevel=2)
-            gain_factor = npy.minimum(gain_factor, 1)
-        gc_center = gain_factor * reflection.conjugate() / (1 - (1 - gain_factor) * npy.abs(reflection) ** 2)
-        gc_radius = (npy.sqrt(1 - gain_factor) * (1 - npy.abs(reflection) ** 2)
-            / (1 - (1 - gain_factor) * npy.abs(reflection) ** 2))
+            gain_factor = np.minimum(gain_factor, 1)
+        gc_center = gain_factor * reflection.conjugate() / (1 - (1 - gain_factor) * np.abs(reflection) ** 2)
+        gc_radius = (np.sqrt(1 - gain_factor) * (1 - np.abs(reflection) ** 2)
+            / (1 - (1 - gain_factor) * np.abs(reflection) ** 2))
 
         # Generate theta values for the points on the circle
-        theta = npy.linspace(0, 2 * npy.pi, npoints)
+        theta = np.linspace(0, 2 * np.pi, npoints)
 
         # Calculate real and imaginary parts of points on the gain circle
-        gc_real = npy.outer(gc_center.real, npy.ones(npoints)) + npy.outer(gc_radius, npy.cos(theta))
-        gc_imag = npy.outer(gc_center.imag, npy.ones(npoints)) + npy.outer(gc_radius, npy.sin(theta))
+        gc_real = np.outer(gc_center.real, np.ones(npoints)) + np.outer(gc_radius, np.cos(theta))
+        gc_imag = np.outer(gc_center.imag, np.ones(npoints)) + np.outer(gc_radius, np.sin(theta))
 
         # Combine real and imaginary parts to create the load gain circle
         gc = (gc_real + 1j * gc_imag).T
         return gc
+
+    def nf_circle(self, nf: float, npoints: int = 181) -> np.ndarray:
+        r"""
+        Returns loci of noise figure circles for a specified noise figure. The network must have two ports and noise
+        data. The center and radius of the noise figure circle are calculated by the following equations [#]_.
+
+        .. math::
+
+            C_{F} = \frac{\Gamma_{opt}}{N + 1}
+
+        .. math::
+
+            R_{F} = \frac{\sqrt{N(N +1 - |\Gamma_{opt}|^2)}}{N + 1}
+
+        where :math:`N` is the noise figure parameter defined by
+
+        .. math::
+
+            N = \frac{|\Gamma_{s}-\Gamma_{opt}|^2}{1-|\Gamma_{s}|^2} = \frac{F-F_{min}}{4R_{N}/Z_{0}}|1+\Gamma_{opt}|^2
+
+
+        Parameters
+        ----------
+        nf : float
+            Noise figure of network in decibels.
+        npoints : int, optional
+            The number of points on the circumference of the circle.
+            More points result in a smoother circle, but require more computation. Default is 181.
+
+        Returns
+        -------
+        nfc : :class:`numpy.ndarray` (shape is `npoints x f`)
+            Loci of noise figure circles in complex numbers
+
+        Example
+        --------
+        >>> import skrf as rf
+        >>> import matplotlib.pyplot as plt
+
+        Create a two-port network object
+
+        >>> ntwk = rf.Network('ntwk_noise.s2p')
+
+        Calculate the noise figure circles for all the frequencies at a noise figure of 1 dB
+
+        >>> nfc = ntwk.nf_circle(nf=1.0)
+
+        Plot the circles on the smith chart
+
+        >>> rf.plotting.plot_smith(s=nfc, smith_r=1, marker='o')
+        >>> plt.show()
+
+        Slicing the network allows you to specify a frequency
+
+        >>> nfc = ntwk['1GHz'].nf_circle(nf=1.0)
+        >>> rf.plotting.plot_smith(s=nfc, smith_r=1, marker='o')
+        >>> plt.show()
+
+        References
+        ----------
+        ..  [#] David. M. Pozar, "Microwave Engineering, Fourth Edition," Wiley, p. 580, 2011.
+
+        See Also
+        --------
+        stability_circle
+        gain_circle
+        g_opt: The optimum source reflection coefficient to minimize noise.
+        nf_min : The minimum noise figure of the network.
+        rn : The equivalent noise resistance of the network.
+
+        """
+        if self.nports != 2:
+            raise ValueError("Noise figure circles are defined only for two-port networks")
+
+        if npoints <= 0:
+            raise ValueError("npoints must be a positive integer")
+
+        if not self.noisy:
+            raise ValueError("Network must have noise data")
+
+        if nf < self.nfmin_db.any():
+            warnings.warn("The specified noise figure is less than the minimum achievable by the matching network. "
+                          "Specify a larger noise figure.", RuntimeWarning, stacklevel=2)
+
+        # Compute noise figure circle center and radius
+        N = np.abs(1+self.g_opt)**2 * (10**(nf/10) - self.nfmin) / (4*self.rn / self.z0[0, 0])
+        nfc_center = self.g_opt / (N + 1)
+        nfc_radius = np.sqrt(N*(N + 1 - abs(self.g_opt) ** 2)) / (N + 1)
+
+        # Generate theta values for the points on the circle
+        theta = np.linspace(0, 2 * np.pi, npoints)
+
+        # Calculate real and imaginary parts of points on the noise figure circle
+        nfc_real = np.outer(nfc_center.real, np.ones(npoints)) + np.outer(nfc_radius, np.cos(theta))
+        nfc_imag = np.outer(nfc_center.imag, np.ones(npoints)) + np.outer(nfc_radius, np.sin(theta))
+
+        # Combine real and imaginary parts to create the noise figure circle
+        nfc = (nfc_real + 1j * nfc_imag).T
+        return nfc
 
     _plot_attribute_doc = r"""
     plot the Network attribute :attr:`{attribute}_{conversion}` component vs {x_axis}.
@@ -4549,8 +4818,8 @@ class Network:
 
     @axes_kwarg
     def plot_attribute(     self,
-                            attribute: str,
-                            conversion: str,
+                            attribute: PrimaryPropertiesT,
+                            conversion: ComponentFuncT,
                             m=None,
                             n=None,
                             ax: Axes=None,
@@ -4558,7 +4827,9 @@ class Network:
                             y_label=None,
                             logx=False, **kwargs):
 
-
+        # create y_label if not provided
+        if y_label is None:
+            y_label = Network.Y_LABEL_DICT[conversion]
         # create index lists, if not provided by user
         if m is None:
             M = range(self.number_of_ports)
@@ -4574,6 +4845,24 @@ class Network:
         else:
             gen_label = False
 
+        if conversion in ["time_impulse", "time_step"]:
+            xlabel = "Time (ns)"
+
+            t_func_kwargs = {"squeeze": False}
+            for key in {"window", "n", "pad", "bandpass"} & kwargs.keys():
+                t_func_kwargs[key] = kwargs.pop(key)
+
+            if conversion == "time_impulse":
+                x, y = self.impulse_response(**t_func_kwargs)
+            else:
+                x, y = self.step_response(**t_func_kwargs)
+
+            if attribute[0].lower() == "z":
+                y_label = "Z (Ohm)"
+                y[x ==  1.] =  1. + 1e-12  # solve numerical singularity
+                y[x == -1.] = -1. + 1e-12  # solve numerical singularity
+                y = self.z0[0].real * (1+y) / (1-y)
+
         for m in M:
             for n in N:
                 # set the legend label for this trace to the networks
@@ -4583,23 +4872,6 @@ class Network:
                     kwargs['label'] = rfplt._get_label_str(self, attribute[0].upper(), m, n)
 
                 if conversion in ["time_impulse", "time_step"]:
-                    xlabel = "Time (ns)"
-
-                    t_func_kwargs = {"squeeze": False}
-                    for key in {"window", "n", "pad", "bandpass"} & kwargs.keys():
-                        t_func_kwargs[key] = kwargs.pop(key)
-
-                    if conversion == "time_impulse":
-                        x, y = self.impulse_response(**t_func_kwargs)
-                    else:
-                        x, y = self.step_response(**t_func_kwargs)
-
-                    if attribute[0].lower() == "z":
-                        y_label = "Z (Ohm)"
-                        y[x ==  1.] =  1. + 1e-12  # solve numerical singularity
-                        y[x == -1.] = -1. + 1e-12  # solve numerical singularity
-                        y = self.z0[0,0].real * (1+y) / (1-y)
-
                     rfplt.plot_rectangular(x=x * 1e9,
                                         y=y[:, m, n],
                                         x_label=xlabel,
@@ -4614,10 +4886,10 @@ class Network:
                         x = self.frequency.t_ns
                         y=self.attribute(attribute, conversion)[:, m, n]
                         if conversion in ["time_mag", "time"]:
-                            y = npy.abs(y)
+                            y = np.abs(y)
 
                     else:
-                        xlabel = 'Frequency (%s)' % self.frequency.unit
+                        xlabel = f'Frequency ({self.frequency.unit})'
                         # x = self.frequency.f_scaled
                         x = self.frequency.f  # always plot f, and then scale the ticks instead
                         y = self.attribute(attribute, conversion)[:, m, n]
@@ -4660,7 +4932,7 @@ class Network:
 
     @copy_doc(rfplt.plot_s_db_time)
     def plot_s_db_time(self, center_to_dc=None, *args, **kwargs):
-        return rfplt.plot_s_db_time(self, center_to_dc, *args, **kwargs)
+        return rfplt.plot_s_db_time(self, *args, center_to_dc=center_to_dc, **kwargs)
 
     @copy_doc(rfplt.plot_s_smith)
     def plot_s_smith(self, m=None, n=None,r=1, ax=None, show_legend=True,\
@@ -4682,8 +4954,11 @@ class Network:
 
     def _fmt_trace_name(self, m: int, n: int) -> str:
         port_sep = "_" if self.nports > 9 else ""
+        subscript = f"{self.port_modes[m].lower()}{self.port_modes[n].lower()}"
+        # do not add subscript for single-ended to single-ended
+        subscript = "" if subscript == "ss" else subscript
 
-        return f"{m + 1}{port_sep}{n + 1}"
+        return f"{subscript}{m + 1}{port_sep}{n + 1}"
 
 
 for func_name, (_func, prop_name, conversion) in Network._generated_functions().items():
@@ -4767,6 +5042,7 @@ def connect(ntwkA: Network, k: int, ntwkB: Network, l: int, num: int = 1) -> Net
     --------
     connect_s : actual  S-parameter connection algorithm.
     innerconnect_s : actual S-parameter connection algorithm.
+    innerconnect_s_lstsq : actual S-parameter connection algorithm using lstsq.
 
 
     Examples
@@ -4782,7 +5058,7 @@ def connect(ntwkA: Network, k: int, ntwkB: Network, l: int, num: int = 1) -> Net
     try:
         check_frequency_equal(ntwkA, ntwkB)
     except IndexError as e:
-        common_freq = npy.intersect1d(ntwkA.frequency.f, ntwkB.frequency.f, return_indices=True)
+        common_freq = np.intersect1d(ntwkA.frequency.f, ntwkB.frequency.f, return_indices=True)
         if common_freq[0].size == 0:
             raise e
         else:
@@ -4826,29 +5102,31 @@ def connect(ntwkA: Network, k: int, ntwkB: Network, l: int, num: int = 1) -> Net
         s_def = 'traveling'
 
     # create output Network, from copy of input
-    ntwkC = ntwkA.copy()
+    # Since ntwkC's s-parameters will change later, use shallow_copy for speedup
+    ntwkC = ntwkA.copy(shallow_copy=True)
 
     # if networks' z0's are not identical, then connect a impedance
     # mismatch, which takes into account the effect of differing port
     # impedances.
     # import pdb;pdb.set_trace()
-    if not assert_z0_at_ports_equal(ntwkA, k, ntwkB, l):
-        ntwkC.s = connect_s(
-            ntwkA.s, k,
-            impedance_mismatch(ntwkA.z0[:, k], ntwkB.z0[:, l], s_def), 0)
+    z0_equal = assert_z0_at_ports_equal(ntwkA, k, ntwkB, l)
+    if not z0_equal:
+        # connect a impedance mismatch, which will takes into account the
+        # effect of differing port impedances
+        mismatch = impedance_mismatch(ntwkA.z0[:, k], ntwkB.z0[:, l], s_def)
+        ntwkC.s = connect_s(ntwkA.s, k, mismatch, 0, num=-1)
         # the connect_s() put the mismatch's output port at the end of
         #   ntwkC's ports.  Fix the new port's impedance, then insert it
         #   at position k where it belongs.
-        ntwkC.z0[:, k:] = npy.hstack((ntwkC.z0[:, k + 1:], ntwkB.z0[:, [l]]))
+        ntwkC.z0[:, k:] = np.hstack((ntwkC.z0[:, k + 1:], ntwkB.z0[:, [l]]))
         ntwkC.renumber(from_ports=[ntwkC.nports - 1] + list(range(k, ntwkC.nports - 1)),
                        to_ports=list(range(k, ntwkC.nports)))
-
     # call s-matrix connection function
-    ntwkC.s = connect_s(ntwkC.s, k, ntwkB.s, l)
+    ntwkC.s = connect_s(ntwkC.s if not z0_equal else ntwkA.s, k, ntwkB.s, l, num)
 
     # combine z0 arrays and remove ports which were `connected`
-    ntwkC.z0 = npy.hstack(
-        (npy.delete(ntwkA.z0, range(k, k + 1), 1), npy.delete(ntwkB.z0, range(l, l + 1), 1)))
+    ntwkC.z0 = np.hstack(
+        (np.delete(ntwkA.z0, range(k, k + 1), 1), np.delete(ntwkB.z0, range(l, l + 1), 1)))
 
     # if we're connecting more than one port, call innerconnect recursively
     # until all connections are made to finish the job
@@ -4856,14 +5134,19 @@ def connect(ntwkA: Network, k: int, ntwkB: Network, l: int, num: int = 1) -> Net
         ntwkC = innerconnect(ntwkC, k, ntwkA.nports - 1 + l, num - 1)
 
     # if ntwkB is a 2port, then keep port indices where you expect.
-    if ntwkB.nports == 2 and ntwkA.nports > 2 and num == 1:
+    if ntwkB.nports == 2 and ntwkA.nports >= 2 and num == 1:
         from_ports = list(range(ntwkC.nports))
         to_ports = list(range(ntwkC.nports))
         to_ports.pop(k)
         to_ports.append(k)
 
         ntwkC.renumber(from_ports=from_ports,
-                       to_ports=to_ports)
+                       to_ports=to_ports,
+                       only_z0=True)
+
+    # Clear the ntwkC's ext_attrs, since they may have been inherited from ntwkA
+    # If a open, ground or port terminal is connected, this property should not be inherited
+    ntwkC._ext_attrs = {}
 
     # if ntwkA and ntwkB are both 2port, and either one has noise, calculate ntwkC's noise
     either_are_noisy = False
@@ -4880,9 +5163,9 @@ def connect(ntwkA: Network, k: int, ntwkB: Network, l: int, num: int = 1) -> Net
         noise_freq = ntwkB.noise_freq
 
       if cA is None:
-        cA = npy.broadcast_arrays(npy.array([[0., 0.], [0., 0.]]), ntwkB.noise)[0]
+        cA = np.broadcast_arrays(np.array([[0., 0.], [0., 0.]]), ntwkB.noise)[0]
       if cB is None:
-        cB = npy.broadcast_arrays(npy.array([[0., 0.], [0., 0.]]), ntwkA.noise)[0]
+        cB = np.broadcast_arrays(np.array([[0., 0.], [0., 0.]]), ntwkA.noise)[0]
 
       if k == 0:
         # if we're connecting to the "input" port of ntwkA, recalculate the equivalent noise of ntwkA,
@@ -4896,37 +5179,55 @@ def connect(ntwkA: Network, k: int, ntwkB: Network, l: int, num: int = 1) -> Net
         raise (NotImplementedError)
 
       # interpolate abcd into the set of noise frequencies
-
-
-      if ntwkA.deembed :
-          if ntwkA.frequency.f.size > 1 :
-              a_real = interp1d(ntwkA.frequency.f, ntwkA.inv.a.real,
-                      axis=0, kind=Network.noise_interp_kind)
-              a_imag = interp1d(ntwkA.frequency.f, ntwkA.inv.a.imag,
-                      axis=0, kind=Network.noise_interp_kind)
+      if ntwkA.deembed:
+          if ntwkA.frequency.f.size > 1:
+              a_real = interp1d(
+                  ntwkA.frequency.f,
+                  ntwkA.inv.a.real,
+                  axis=0,
+                  bounds_error=False,
+                  kind=ntwkA.noise_interp_kind
+              )
+              a_imag = interp1d(
+                  ntwkA.frequency.f,
+                  ntwkA.inv.a.imag,
+                  axis=0,
+                  bounds_error=False,
+                  kind=ntwkA.noise_interp_kind
+              )
               a = a_real(noise_freq.f) + 1.j * a_imag(noise_freq.f)
-          else :
+          else:
               a_real = ntwkA.inv.a.real
               a_imag = ntwkA.inv.a.imag
               a = a_real + 1.j * a_imag
 
           a = npy_inv(a)
-          a_H = npy.conj(a.transpose(0, 2, 1))
-          cC = npy.matmul(a, npy.matmul(cB -cA, a_H))
-      else :
-          if ntwkA.frequency.f.size > 1 :
-              a_real = interp1d(ntwkA.frequency.f, ntwkA.a.real,
-                      axis=0, kind=Network.noise_interp_kind)
-              a_imag = interp1d(ntwkA.frequency.f, ntwkA.a.imag,
-                      axis=0, kind=Network.noise_interp_kind)
+          a_H = np.conj(a.transpose(0, 2, 1))
+          cC = np.matmul(a, np.matmul(cB -cA, a_H))
+      else:
+          if ntwkA.frequency.f.size > 1:
+              a_real = interp1d(
+                  ntwkA.frequency.f,
+                  ntwkA.a.real,
+                  axis=0,
+                  bounds_error=False,
+                  kind=ntwkA.noise_interp_kind
+              )
+              a_imag = interp1d(
+                  ntwkA.frequency.f,
+                  ntwkA.a.imag,
+                  axis=0,
+                  bounds_error=False,
+                  kind=ntwkA.noise_interp_kind
+              )
               a = a_real(noise_freq.f) + 1.j * a_imag(noise_freq.f)
           else :
               a_real = ntwkA.a.real
               a_imag = ntwkA.a.imag
               a = a_real + 1.j * a_imag
 
-          a_H = npy.conj(a.transpose(0, 2, 1))
-          cC = npy.matmul(a, npy.matmul(cB, a_H)) + cA
+          a_H = np.conj(a.transpose(0, 2, 1))
+          cC = np.matmul(a, np.matmul(cB, a_H)) + cA
       ntwkC.noise = cC
       ntwkC.noise_freq = noise_freq
 
@@ -4961,6 +5262,190 @@ def connect_fast(ntwkA: Network, k: int, ntwkB: Network, l: int) -> Network:
     return connect(ntwkA, k, ntwkB, l)
 
 
+def parallelconnect(ntwks: Sequence[Network] | Network,
+                    ports: Sequence[int | Sequence[int]],
+                    name: str | None = None) -> Network:
+    """
+    Connects a series of multi-port networks in parallel, ensuring that the specified port
+    indices share the concatenated intersection.
+
+    Parameters
+    ----------
+    ntwks : :Sequence[`Network`] | `Network`
+            A sequence of multi-port networks or a single network to be connected in parallel.
+    ports : Sequence[int  |  Sequence[int]]
+            A sequence of port indices, where each entry can be an int or a sequence of ints
+            corresponding to the ports of the respective network. The length of `ports` should
+            match the length of `networks`. Each specified port index is connect to the
+            concatenated intersection, implying they are electrically common.
+    name : str, optional
+            define the connected network's name. Default is None.
+
+
+    Returns
+    -------
+    connected_network : :class:`Network`
+            A new network created from the parallel connection of the input networks.
+            The number of ports in the resulting network equals the sum of ports in `ntwks`,
+            minus the number of ports specified in `ports` that were connected in parallel.
+            The remaining ports follow the original port order of the input networks, after
+            removing those involved in the parallel connection.
+
+
+    Note
+    ----
+    This function calculates the resulting scattering parameters after parallel connecting
+    a set of networks. This algorithm, adapted from the `Circuit.s` method, constructs the
+    concatenated intersection matrix [X] and the global scattering matrix [C] to perform
+    the calculations.
+
+
+    See Also
+    --------
+    connect_s : actual S-parameter connection algorithm.
+    innerconnect_s : actual S-parameter connection algorithm.
+    innerconnect_s_lstsq : actual S-parameter connection algorithm using lstsq.
+
+
+    Examples
+    --------
+
+    The following examples demonstrate how to use the :func:`parallelconnect` in
+    different ways, such as open a port, connect two networks, innerconnect one
+    network, and parallel multiple networks.
+
+    >>> # Prepare the example Networks
+    >>> ntwkA = rf.Network('ntwkA.s2p')
+    >>> ntwkB = rf.Network('ntwkB.s2p')
+    >>> ntwkC = rf.connect('ntwkC.s4p')
+    >>>
+    >>> # 1) Open port 1 of ntwkA
+    >>> #    +-----+
+    >>> #   [0] A [1]--Open
+    >>> #    +-----+
+    >>> #
+    >>> rf.parallelconnect(ntwkA, [1])
+    >>>
+    >>>
+    >>> # 2) Connect ntwkA's port 1 to ntwkB's port 0
+    >>> #    +-----+     +-----+
+    >>> #   [0] A [1]---[0] B [1]
+    >>> #    +-----+     +-----+
+    >>> #
+    >>> rf.parallelconnect([ntwkA, ntwkB], [1, 0])
+    >>>
+    >>>
+    >>> # 3) Innerconnect the ntwkC's port 1 and 3
+    >>> #  +-----+
+    >>> #  |    [1]--+
+    >>> # [0] C [2]  |
+    >>> #  |    [3]--+
+    >>> #  +-----+
+    >>> #
+    >>> rf.parallelconnect(ntwkC, [[2, 3]])
+    >>>
+    >>>
+    >>> # 4) Parallel connect the ntwkA's port 1, ntwkB's port 1 and ntwkC's port 0
+    >>> #  +-----+
+    >>> # [0] A [1]---+    +-----+
+    >>> #  +-----+    |    |    [1]
+    >>> #             |---[0] C [2]
+    >>> #  +-----+    |    |    [3]
+    >>> # [0] B [1]---+    +-----+
+    >>> #  +-----+
+    >>> #
+    >>> rf.parallelconnect([ntwkA, ntwkB, ntwkC], [1, 1, 0])
+    >>>
+    >>>
+    >>> # 5) The port order of connected ntwk follows the order of ntwks and ports
+    >>> # as shown in example 4:
+    >>> #  +-----+
+    >>> # [0] A [1]---+    +-----+          +---------------+
+    >>> #  +-----+    |    |    [1]        [0]=A[0]   C[3]=[3]
+    >>> #             |---[0] C [2]  ===>  [1]=B[0]         |
+    >>> #  +-----+    |    |    [3]        [2]=C[1]   C[3]=[4]
+    >>> # [0] B [1]---+    +-----+          +---------------+
+    >>> #  +-----+
+
+    References
+    ----------
+    .. [#] P. Hallbjörner, Microw. Opt. Technol. Lett. 38, 99 (2003).
+    """
+    # Handle single network input
+    if isinstance(ntwks, Network):
+        ntwks = [ntwks]
+
+    if len(ntwks) != len(ports):
+        raise ValueError(f'ntwks and ports must have the same length ({len(ntwks)} != {len(ports)})')
+
+    # Ensure unique networks
+    if len(set(ntw.name for ntw in ntwks)) != len(ntwks):
+        raise ValueError('ntwks should not be duplicated.')
+
+    # Get the index of each network in the list
+    dim, off = sum(ntw.nports for ntw in ntwks), 0
+    inter_indices, exter_indices =  [], []
+    z0_in, z0_ext = [], []
+
+    # Assign the global scattering matrix [X] and concatenated intersection matrix [C]
+    X = np.zeros((ntwks[0].frequency.npoints, dim, dim), dtype='complex')
+    C = np.zeros((ntwks[0].frequency.npoints, dim, dim), dtype='complex')
+
+    for ntw, port in zip(ntwks, ports):
+        # Get the nports of Network
+        nports: int = ntw.nports
+
+        # Convert the int port to list
+        port = [port] if isinstance(port, int) else port
+
+        # Che the port indecies valid or not
+        if len(port) != len(set(port)):
+            raise ValueError(f"{ntw.name}'s port should not be duplicated.")
+        if max(port) >= nports or min(port) < 0:
+            raise ValueError(f"{ntw.name}'s port index should be between 0 and {nports-1}")
+
+        # Check the frequency equal or not
+        check_frequency_equal(ntw, ntwks[0])
+
+        # Append the port index with offset to indices list
+        for p in range(nports):
+            if p in port:
+                inter_indices.append(p + off)
+                z0_in.append(ntw.z0[:, p])
+            else:
+                exter_indices.append(p + off)
+                z0_ext.append(ntw.z0[:, p])
+
+        # Assign the scattering matrix of each network to the global scattering matrix
+        X[:, off:off+nports, off:off+nports] = ntw.s_traveling
+
+        # Update the offset
+        off += nports
+
+    # Compute interaction matrix for internal connections
+    z0s = np.array(z0_in).T
+    y0s = 1./z0s
+    y_tot = y0s.sum(axis=1)
+
+    s = 2 *np.sqrt(np.einsum('ki,kj->kij', y0s, y0s)) / y_tot[:, None, None]
+    np.einsum('kii->ki', s)[:] -= 1  # Sii
+
+    # Get the index of internal port and external port from global matrix
+    in_ind = np.meshgrid(inter_indices, inter_indices, indexing='ij')
+    out_ind = np.meshgrid(exter_indices, exter_indices, indexing='ij')
+
+    # Update the concatenated intersection matrix
+    C[:, in_ind[0], in_ind[1]] = s
+
+    # Get the global scattering matrix
+    s = X @ np.linalg.inv(np.identity(dim) - C @ X)
+
+    return Network(frequency = ntwks[0].frequency,
+                   s = s[:, out_ind[0], out_ind[1]],
+                   z0 = np.array(z0_ext).T,
+                   name = name)
+
+
 def innerconnect(ntwkA: Network, k: int, l: int, num: int = 1) -> Network:
     """
     Connect ports of a single n-port network.
@@ -4993,6 +5478,7 @@ def innerconnect(ntwkA: Network, k: int, l: int, num: int = 1) -> Network:
     --------
     connect_s : actual  S-parameter connection algorithm.
     innerconnect_s : actual S-parameter connection algorithm.
+    innerconnect_s_lstsq : actual S-parameter connection algorithm using lstsq.
 
 
     Examples
@@ -5009,32 +5495,36 @@ def innerconnect(ntwkA: Network, k: int, l: int, num: int = 1) -> Network:
     if (l + num - 1 > ntwkA.nports - 1):
         raise IndexError('Port `l` out of range')
 
+    # 'power' is not supported, convert to supported definition and back afterwards
+    if ntwkA.s_def == 'power':
+        ntwkA = ntwkA.copy()
+        ntwkA.renormalize(ntwkA.z0, 'pseudo')
+
     # create output Network, from copy of input
-    ntwkC = ntwkA.copy()
+    # Since ntwkC's s-parameters will change later, use shallow_copy for speedup
+    ntwkC = ntwkA.copy(shallow_copy=True)
 
     s_def_original = ntwkC.s_def
 
-    # 'power' is not supported, convert to supported definition and back afterwards
-    if ntwkC.s_def == 'power':
-        ntwkC.renormalize(ntwkC.z0, 'pseudo')
+    z0_equal = (ntwkC.z0[:, k] == ntwkC.z0[:, l]).all()
 
-    if not (ntwkC.z0[:, k] == ntwkC.z0[:, l]).all():
+    if not z0_equal:
         # connect a impedance mismatch, which will takes into account the
         # effect of differing port impedances
-        mismatch = impedance_mismatch(ntwkC.z0[:, k], ntwkC.z0[:, l], ntwkC.s_def)
-        ntwkC.s = connect_s(ntwkC.s, k, mismatch, 0)
+        mismatch = impedance_mismatch(ntwkA.z0[:, k], ntwkA.z0[:, l], ntwkA.s_def)
+        ntwkC.s = connect_s(ntwkA.s, k, mismatch, 0, num=-1)
         # the connect_s() put the mismatch's output port at the end of
         #   ntwkC's ports.  Fix the new port's impedance, then insert it
         #   at position k where it belongs.
-        ntwkC.z0[:, k:] = npy.hstack((ntwkC.z0[:, k + 1:], ntwkC.z0[:, [l]]))
+        ntwkC.z0[:, k:] = np.hstack((ntwkC.z0[:, k + 1:], ntwkC.z0[:, [l]]))
         ntwkC.renumber(from_ports=[ntwkC.nports - 1] + list(range(k, ntwkC.nports - 1)),
                        to_ports=list(range(k, ntwkC.nports)))
 
     # call s-matrix connection function
-    ntwkC.s = innerconnect_s(ntwkC.s, k, l)
+    ntwkC.s = innerconnect_s(ntwkC.s if not z0_equal else ntwkA.s, k, l)
 
     # update the characteristic impedance matrix
-    ntwkC.z0 = npy.delete(ntwkC.z0, list(range(k, k + 1)) + list(range(l, l + 1)), 1)
+    ntwkC.z0 = np.delete(ntwkC.z0, list(range(k, k + 1)) + list(range(l, l + 1)), 1)
 
     # recur if we're connecting more than one port
     if num > 1:
@@ -5187,9 +5677,9 @@ def stitch(ntwkA: Network, ntwkB: Network, **kwargs) -> Network:
 
     A, B = ntwkA, ntwkB
     C = Network(
-        frequency=Frequency.from_f(npy.r_[A.f[:], B.f[:]], unit='hz'),
-        s=npy.r_[A.s, B.s],
-        z0=npy.r_[A.z0, B.z0],
+        frequency=Frequency.from_f(np.r_[A.f[:], B.f[:]], unit='hz'),
+        s=np.r_[A.s, B.s],
+        z0=np.r_[A.z0, B.z0],
         name=A.name,
         **kwargs
     )
@@ -5264,7 +5754,7 @@ def overlap_multi(ntwk_list: Sequence[Network]):
 
     return [ntwk.interpolate(new_freq) for ntwk in ntwk_list]
 
-def concat_ports(ntwk_list: Sequence[Network], port_order: str = 'second',
+def concat_ports(ntwk_list: Sequence[Network], port_order: Literal["first", "second"] = "second",
         *args, **kw) -> Network:
     """
     Concatenate networks along the port axis.
@@ -5296,10 +5786,11 @@ def concat_ports(ntwk_list: Sequence[Network], port_order: str = 'second',
     Examples
     --------
 
-    >>>concat([ntwkA,ntwkB])
-    >>>concat([ntwkA,ntwkB,ntwkC,ntwkD], port_order='second')
+    >>> concat([ntwkA,ntwkB])
+    >>> concat([ntwkA,ntwkB,ntwkC,ntwkD], port_order='second')
 
     To put for lines in parallel
+
     >>> from skrf import air
     >>> l1 = air.line(100, z0=[0,1])
     >>> l2 = air.line(300, z0=[2,3])
@@ -5340,13 +5831,14 @@ def concat_ports(ntwk_list: Sequence[Network], port_order: str = 'second',
     nC = nA + nB  # num ports on C
 
     # create composite matrix, appending each sub-matrix diagonally
-    C = npy.zeros((nf, nC, nC), dtype='complex')
+    C = np.zeros((nf, nC, nC), dtype='complex')
     C[:, :nA, :nA] = A.copy()
     C[:, nA:, nA:] = B.copy()
 
     ntwkC = ntwkA.copy()
     ntwkC.s = C
-    ntwkC.z0 = npy.hstack([ntwkA.z0, ntwkB.z0])
+    ntwkC.z0 = np.hstack([ntwkA.z0, ntwkB.z0])
+    ntwkC.port_modes = np.hstack([ntwkA.port_modes, ntwkB.port_modes])
     if port_order == 'second':
         old_order = list(range(nC))
         new_order = list(range(0, nC, 2)) + list(range(1, nC, 2))
@@ -5399,7 +5891,7 @@ def average(list_of_networks: Sequence[Network], polar: bool = False) -> Network
     return out_ntwk
 
 
-def stdev(list_of_networks: Sequence[Network], attr: str = 's') -> npy.ndarray:
+def stdev(list_of_networks: Sequence[Network], attr: str = 's') -> np.ndarray:
     """
     Calculate the standard deviation of a network attribute from a list of Networks.
 
@@ -5425,7 +5917,7 @@ def stdev(list_of_networks: Sequence[Network], attr: str = 's') -> npy.ndarray:
     >>> ntwk_list = [rf.Network('myntwk.s1p'), rf.Network('myntwk2.s1p')]
     >>> ntwk_stdev = rf.stdev(ntwk_list)
     """
-    return npy.array([getattr(network, attr) for network in list_of_networks]).std(axis=0)
+    return np.array([getattr(network, attr) for network in list_of_networks]).std(axis=0)
 
 
 def one_port_2_two_port(ntwk: Network) -> Network:
@@ -5443,17 +5935,17 @@ def one_port_2_two_port(ntwk: Network) -> Network:
         the resultant two-port Network
     """
     result = ntwk.copy()
-    result.s = npy.zeros((result.frequency.npoints, 2, 2), dtype=complex)
+    result.s = np.zeros((result.frequency.npoints, 2, 2), dtype=complex)
     s11 = ntwk.s[:, 0, 0]
     result.s[:, 0, 0] = s11
     result.s[:, 1, 1] = s11
     ## HACK: TODO: verify this mathematically
-    result.s[:, 0, 1] = npy.sqrt(1 - npy.abs(s11) ** 2) * \
-                        npy.exp(1j * (
-                        npy.angle(s11) + npy.pi / 2. * (npy.angle(s11) < 0) - npy.pi / 2 * (npy.angle(s11) > 0)))
+    result.s[:, 0, 1] = np.sqrt(1 - np.abs(s11) ** 2) * \
+                        np.exp(1j * (
+                        np.angle(s11) + np.pi / 2. * (np.angle(s11) < 0) - np.pi / 2 * (np.angle(s11) > 0)))
     result.s[:, 1, 0] = result.s[:, 0, 1]
 
-    result.z0 = npy.hstack([ntwk.z0,ntwk.z0])
+    result.z0 = np.hstack([ntwk.z0,ntwk.z0])
     return result
 
 
@@ -5614,7 +6106,9 @@ def subnetwork(ntwk: Network, ports: int, offby:int = 1) -> Network:
     # create a dummy Network with same frequency and z0 from the original
     subntwk = Network(frequency=ntwk.frequency, z0=ntwk.z0[:,ports], name=subntwk_name)
     # keep requested rows and columns of the s-matrix. ports can be not contiguous
-    subntwk.s = ntwk.s[npy.ix_(npy.arange(ntwk.s.shape[0]), ports, ports)]
+    subntwk.s = ntwk.s[np.ix_(np.arange(ntwk.s.shape[0]), ports, ports)]
+    # keep port_modes
+    subntwk.port_modes = [ntwk.port_modes[idx] for idx in ports]
     # keep port_names
     if ntwk.port_names:
         subntwk.port_names = [ntwk.port_names[idx] for idx in ports]
@@ -5637,14 +6131,14 @@ def n_oneports_2_nport(ntwk_list: Sequence[Network], *args, **kwargs) -> Network
     nport : n-port :class:`Network`
         result
     """
-    nports = int(npy.sqrt(len(ntwk_list)))
+    nports = int(np.sqrt(len(ntwk_list)))
 
-    s_out = npy.concatenate(
-        [npy.concatenate(
+    s_out = np.concatenate(
+        [np.concatenate(
             [ntwk_list[(k + (l * nports))].s for k in range(nports)], 2) \
          for l in range(nports)], 1)
 
-    z0 = npy.concatenate(
+    z0 = np.concatenate(
         [ntwk_list[k].z0 for k in range(0, nports ** 2, nports + 1)], 1)
     frequency = ntwk_list[0].frequency
     return Network(s=s_out, z0=z0, frequency=frequency, **kwargs)
@@ -5698,7 +6192,7 @@ def n_twoports_2_nport(ntwk_list: Sequence[Network], nports: int,
 
     frequency = ntwk_list[0].frequency
     nport = Network(frequency=frequency,
-                    s=npy.zeros(shape=(frequency.npoints, nports, nports)),
+                    s=np.zeros(shape=(frequency.npoints, nports, nports)),
                     **kwargs)
 
     for subntwk in ntwk_list:
@@ -5743,13 +6237,12 @@ def four_oneports_2_twoport(s11: Network, s12: Network, s21: Network, s22: Netwo
     See Also
     --------
     n_oneports_2_nport
-    three_twoports_2_threeport
     """
     return n_oneports_2_nport([s11, s12, s21, s22], *args, **kwargs)
 
 
 ## Functions operating on s-parameter matrices
-def connect_s(A: npy.ndarray, k: int, B: npy.ndarray, l: int) -> npy.ndarray:
+def connect_s(A: np.ndarray, k: int, B: np.ndarray, l: int, num: int = 1) -> np.ndarray:
     """
     Connect two n-port networks' s-matrices together.
 
@@ -5768,6 +6261,8 @@ def connect_s(A: npy.ndarray, k: int, B: npy.ndarray, l: int) -> npy.ndarray:
             S-parameter matrix of `B`, shape is fxnxn
     l : int
             port index on `B`
+    num : int
+            number of consecutive ports to connect (default 1)
 
     Returns
     -------
@@ -5786,6 +6281,7 @@ def connect_s(A: npy.ndarray, k: int, B: npy.ndarray, l: int) -> npy.ndarray:
     --------
     connect : operates on :class:`Network` types
     innerconnect_s : function which implements the connection algorithm
+    innerconnect_s_lstsq : actual S-parameter connection algorithm using lstsq.
 
 
     """
@@ -5799,15 +6295,33 @@ def connect_s(A: npy.ndarray, k: int, B: npy.ndarray, l: int) -> npy.ndarray:
     nC = nA + nB  # num ports on C
 
     # create composite matrix, appending each sub-matrix diagonally
-    C = npy.zeros((nf, nC, nC), dtype='complex')
-    C[:, :nA, :nA] = A.copy()
-    C[:, nA:, nA:] = B.copy()
+    C = np.zeros((nf, nC, nC), dtype='complex', order='F')
 
-    # call innerconnect_s() on composit matrix C
-    return innerconnect_s(C, k, nA + l)
+    # if ntwkB is a 2port, then keep port indices where you expect.
+    if nB == 2 and nA > 2 and num == 1:
+        """
+        Pre-renumber the s-parameters:
+        |A1 A2|         |A1 0 A2|              |A1 A2 0|
+        |     | + |B| = |0  B 0 |, rather than |A3 A4 0|
+        |A3 A4|         |A3 0 A4|              |0  0  B|
+        """
+        C[:, :k, :k] = A[:, :k, :k]
+        C[:, :k, k + nB :] = A[:, :k, k:]
+        C[:, k + nB :, :k] = A[:, k:, :k]
+        C[:, k + nB :, k + nB :] = A[:, k:, k:]
+        C[:, k : k + nB, k : k + nB] = B
+
+        # call innerconnect_s() on composit matrix C
+        return innerconnect_s(C, k + nB, k + l)
+    else:
+        C[:, :nA, :nA] = A
+        C[:, nA:, nA:] = B
+
+        # call innerconnect_s() on composit matrix C
+        return innerconnect_s(C, k, nA + l)
 
 
-def innerconnect_s(A: npy.ndarray, k: int, l: int) -> npy.ndarray:
+def innerconnect_s(A: np.ndarray, k: int, l: int) -> np.ndarray:
     """
     Connect two ports of a single n-port network's s-matrix.
 
@@ -5839,6 +6353,11 @@ def innerconnect_s(A: npy.ndarray, k: int, l: int) -> npy.ndarray:
             new S-parameter matrix
 
 
+    See Also
+    --------
+    innerconnect_s_lstsq : actual S-parameter connection algorithm using lstsq.
+
+
     References
     ----------
     .. [#] Compton, R.C.; , "Perspectives in microwave circuit analysis," Circuits and Systems, 1989.,
@@ -5853,32 +6372,127 @@ def innerconnect_s(A: npy.ndarray, k: int, l: int) -> npy.ndarray:
     """
 
     if k > A.shape[-1] - 1 or l > A.shape[-1] - 1:
-        raise (ValueError('port indices are out of range'))
+        raise (ValueError("port indices are out of range"))
 
     nA = A.shape[1]  # num of ports on input s-matrix
-    # create an empty s-matrix, to store the result
-    C = npy.zeros(shape=A.shape, dtype='complex')
+
+    # Vectorized version of the following loop
+    # through ports to calculate resultant s-parameters
+    # for i in range(nA):
+    #    for j in range(nA):
+    #        C[:, i, j] = A[:, i, j] + (
+    #            A[:, k, j] * A[:, i, l] * (1 - A[:, l, k])
+    #            + A[:, l, j] * A[:, i, k] * (1 - A[:, k, l])
+    #            + A[:, k, j] * A[:, l, l] * A[:, i, k]
+    #            + A[:, l, j] * A[:, k, k] * A[:, i, l]
+    #        ) / ((1 - A[:, k, l]) * (1 - A[:, l, k]) - A[:, k, k] * A[:, l, l])
+    #
+    # external ports index
+    ext_i = [i for i in range(nA) if i not in (k, l)]
+
+    # Indexing sub-matrices of internal ports (only k, l)
+    Akl = 1.0 - A[:, k, l]
+    Alk = 1.0 - A[:, l, k]
+    Akk = A[:, k, k]
+    All = A[:, l, l]
+
+    # create temporary matrices for calculation
+    det = (Akl * Alk - Akk * All)
+
+    # Check if the determinant is almost zero, in which case use lstsq solution
+    if np.allclose(det, 0.0):
+        warnings.warn(
+            'Singular matrix detected, using numpy.linalg.lstsq instead.',
+            RuntimeWarning,
+            stacklevel=2
+        )
+        return innerconnect_s_lstsq(A, k, l)
+
+    # Indexing sub-matrices of other external ports
+    Ake = A[:, k, ext_i].T
+    Ale = A[:, l, ext_i].T
+    Aek = A[:, ext_i, k].T
+    Ael = A[:, ext_i, l].T
+
+    # Create an suit-sized s-matrix, to store the result
+    i, j = np.meshgrid(ext_i, ext_i, indexing='ij', sparse=True)
+    C = A[:, i, j]
+
+    tmp_a = Ael * (Alk / det) + Aek * (All / det)
+    tmp_b = Ael * (Akk / det) + Aek * (Akl / det)
 
     # loop through ports and calculates resultant s-parameters
-    for i in range(nA):
-        for j in range(nA):
-            C[:, i, j] = \
-                A[:, i, j] + \
-                (A[:, k, j] * A[:, i, l] * (1 - A[:, l, k]) + \
-                 A[:, l, j] * A[:, i, k] * (1 - A[:, k, l]) + \
-                 A[:, k, j] * A[:, l, l] * A[:, i, k] + \
-                 A[:, l, j] * A[:, k, k] * A[:, i, l]) / \
-                ((1 - A[:, k, l]) * (1 - A[:, l, k]) - A[:, k, k] * A[:, l, l])
+    for i in range(nA - 2):
+        C[:, i, :] += (Ake * tmp_a[i] + Ale * tmp_b[i]).T
 
-    # remove ports that were `connected`
-    C = npy.delete(C, (k, l), 1)
-    C = npy.delete(C, (k, l), 2)
+    return C
+
+def innerconnect_s_lstsq(A: np.ndarray, k: int, l: int) -> np.ndarray:
+    """
+    Connect two ports of a single n-port network's s-matrix using a
+    least-squares solution. It uses a least-squares approach to handle
+    cases where the determinant of the sub-matrix is close to zero, which
+    can lead to numerical instability in the direct formula.
+
+
+    Note
+    ----
+    If the determinant of the sub-matrix is not close to zero, it is recommended
+    to use the `innerconnect_s` function instead, which uses a direct formula
+    for better numerical stability.
+
+
+    Parameters
+    ----------
+    A : :class:`numpy.ndarray`
+        S-parameter matrix of `A`, shape is fxnxn
+    k : int
+        port index on `A` (port indices start from 0)
+    l : int
+        port index on `A`
+
+    Returns
+    -------
+    AEE : :class:`numpy.ndarray`
+            new S-parameter matrix
+
+
+    See Also
+    --------
+    connect_s : actual  S-parameter connection algorithm.
+    innerconnect_s : actual S-parameter connection algorithm.
+    """
+
+    if k > A.shape[-1] - 1 or l > A.shape[-1] - 1:
+        raise (ValueError("port indices are out of range"))
+
+    nA = A.shape[1]  # num of ports on input s-matrix
+
+    # Identify internal and external port indices
+    int_i = (k, l)
+    ext_i = [i for i in range(nA) if i not in int_i]
+
+    # Extract sub-matrices for internal and external ports
+    AI = A[:, int_i[::-1], :]
+    AE = A[:, ext_i, :]
+    AII = AI[:, :, int_i]
+    AIE = AI[:, :, ext_i]
+    AEI = AE[:, :, int_i]
+    AEE = AE[:, :, ext_i]
+
+    # Preprocess AII and AEE matrix
+    AII = np.eye(2)[None, :, :] - AII
+    C = np.array(AEE, order='C')
+
+    # Perform least-squares solution for each frequency
+    for i in range(A.shape[0]):
+        C[i, :, :] += AEI[i, :, :] @ np.linalg.lstsq(AII[i, :, :], AIE[i, :, :], rcond=None)[0]
 
     return C
 
 
 ## network parameter conversion
-def s2z(s: npy.ndarray, z0: NumberLike = 50, s_def: str = S_DEF_DEFAULT) -> npy.ndarray:
+def s2z(s: np.ndarray, z0: NumberLike = 50, s_def: SdefT = S_DEF_DEFAULT) -> np.ndarray:
     r"""
     Convert scattering parameters [#]_ to impedance parameters [#]_.
 
@@ -5935,42 +6549,42 @@ def s2z(s: npy.ndarray, z0: NumberLike = 50, s_def: str = S_DEF_DEFAULT) -> npy.
     z0 = z0.astype(dtype=complex)
     z0[z0.real == 0] += ZERO
 
-    s = npy.array(s, dtype=complex)
+    s = np.array(s, dtype=complex)
 
     # The following is a vectorized version of a for loop for all frequencies.
     # # Creating Identity matrices of shape (nports,nports) for each nfreqs
-    Id = npy.zeros_like(s)  # (nfreqs, nports, nports)
-    npy.einsum('ijj->ij', Id)[...] = 1.0
+    Id = np.zeros_like(s)  # (nfreqs, nports, nports)
+    np.einsum('ijj->ij', Id)[...] = 1.0
 
     if s_def == 'power':
         # Power-waves. Eq.(19) from [Kurokawa et al.]
         # Creating diagonal matrices of shape (nports,nports) for each nfreqs
-        F, G = npy.zeros_like(s), npy.zeros_like(s)
-        npy.einsum('ijj->ij', F)[...] = 1.0/(2*npy.sqrt(z0.real))
-        npy.einsum('ijj->ij', G)[...] = z0
-        z = npy.linalg.solve(mf.nudge_eig((Id - s) @ F), (s @ G + npy.conjugate(G)) @ F)
+        F, G = np.zeros_like(s), np.zeros_like(s)
+        np.einsum('ijj->ij', F)[...] = 1.0/(2*np.sqrt(z0.real))
+        np.einsum('ijj->ij', G)[...] = z0
+        z = np.linalg.solve(mf.nudge_eig((Id - s) @ F), (s @ G + np.conjugate(G)) @ F)
 
     elif s_def == 'pseudo':
         # Pseudo-waves. Eq.(74) from [Marks et al.]
         # Creating diagonal matrices of shape (nports,nports) for each nfreqs
-        ZR, U = npy.zeros_like(s), npy.zeros_like(s)
-        npy.einsum('ijj->ij', U)[...] = npy.sqrt(z0.real)/npy.abs(z0)
-        npy.einsum('ijj->ij', ZR)[...] = z0
-        USU = npy.linalg.solve(U, s @ U)
-        z = npy.linalg.solve(mf.nudge_eig(Id - USU), (Id + USU) @ ZR)
+        ZR, U = np.zeros_like(s), np.zeros_like(s)
+        np.einsum('ijj->ij', U)[...] = np.sqrt(z0.real)/np.abs(z0)
+        np.einsum('ijj->ij', ZR)[...] = z0
+        USU = np.linalg.solve(U, s @ U)
+        z = np.linalg.solve(mf.nudge_eig(Id - USU), (Id + USU) @ ZR)
 
     elif s_def == 'traveling':
         # Traveling-waves definition. Cf.Wikipedia "Impedance parameters" page.
         # Creating diagonal matrices of shape (nports, nports) for each nfreqs
-        sqrtz0 = npy.zeros_like(s)
-        npy.einsum('ijj->ij', sqrtz0)[...] = npy.sqrt(z0)
-        z = sqrtz0 @ npy.linalg.solve(mf.nudge_eig(Id - s), (Id + s) @ sqrtz0)
+        sqrtz0 = np.zeros_like(s)
+        np.einsum('ijj->ij', sqrtz0)[...] = np.sqrt(z0)
+        z = sqrtz0 @ np.linalg.solve(mf.nudge_eig(Id - s), (Id + s) @ sqrtz0)
     else:
         raise ValueError(f'Unknown s_def: {s_def}')
 
     return z
 
-def s2y(s: npy.ndarray, z0:NumberLike = 50, s_def: str = S_DEF_DEFAULT) -> npy.ndarray:
+def s2y(s: np.ndarray, z0:NumberLike = 50, s_def: SdefT = S_DEF_DEFAULT) -> np.ndarray:
     """
     Convert scattering parameters [#]_ to admittance parameters [#]_.
 
@@ -6033,41 +6647,41 @@ def s2y(s: npy.ndarray, z0:NumberLike = 50, s_def: str = S_DEF_DEFAULT) -> npy.n
     z0 = z0.astype(dtype=complex)
     z0[z0.real == 0] += ZERO
 
-    s = npy.array(s, dtype=complex)
+    s = np.array(s, dtype=complex)
 
     # The following is a vectorized version of a for loop for all frequencies.
     # Creating Identity matrices of shape (nports,nports) for each nfreqs
-    Id = npy.zeros_like(s)  # (nfreqs, nports, nports)
-    npy.einsum('ijj->ij', Id)[...] = 1.0
+    Id = np.zeros_like(s)  # (nfreqs, nports, nports)
+    np.einsum('ijj->ij', Id)[...] = 1.0
 
     if s_def == 'power':
         # Power-waves. Inverse of Eq.(19) from [Kurokawa et al.]
         # Creating diagonal matrices of shape (nports,nports) for each nfreqs
-        F, G = npy.zeros_like(s), npy.zeros_like(s)
-        npy.einsum('ijj->ij', F)[...] = 1.0/(2*npy.sqrt(z0.real))
-        npy.einsum('ijj->ij', G)[...] = z0
-        y = npy.linalg.solve(mf.nudge_eig((s @ G + npy.conjugate(G)) @ F), (Id - s) @ F)
+        F, G = np.zeros_like(s), np.zeros_like(s)
+        np.einsum('ijj->ij', F)[...] = 1.0/(2*np.sqrt(z0.real))
+        np.einsum('ijj->ij', G)[...] = z0
+        y = np.linalg.solve(mf.nudge_eig((s @ G + np.conjugate(G)) @ F), (Id - s) @ F)
 
     elif s_def == 'pseudo':
         # pseudo-waves. Inverse of Eq.(74) from [Marks et al.]
-        YR, U = npy.zeros_like(s), npy.zeros_like(s)
-        npy.einsum('ijj->ij', U)[...] = npy.sqrt(z0.real)/npy.abs(z0)
-        npy.einsum('ijj->ij', YR)[...] = 1/z0
-        USU = npy.linalg.solve(U, s @ U)
-        y = YR @ npy.linalg.solve(mf.nudge_eig(Id + USU), Id - USU)
+        YR, U = np.zeros_like(s), np.zeros_like(s)
+        np.einsum('ijj->ij', U)[...] = np.sqrt(z0.real)/np.abs(z0)
+        np.einsum('ijj->ij', YR)[...] = 1/z0
+        USU = np.linalg.solve(U, s @ U)
+        y = YR @ np.linalg.solve(mf.nudge_eig(Id + USU), Id - USU)
 
     elif s_def == 'traveling':
         # Traveling-waves definition. Cf.Wikipedia "Impedance parameters" page.
         # Creating diagonal matrices of shape (nports, nports) for each nfreqs
-        sqrty0 = npy.zeros_like(s)  # (nfreqs, nports, nports)
-        npy.einsum('ijj->ij', sqrty0)[...] = npy.sqrt(1.0/z0)
-        y = sqrty0 @ (Id - s) @ npy.linalg.solve(mf.nudge_eig(Id + s), sqrty0)
+        sqrty0 = np.zeros_like(s)  # (nfreqs, nports, nports)
+        np.einsum('ijj->ij', sqrty0)[...] = np.sqrt(1.0/z0)
+        y = sqrty0 @ (Id - s) @ np.linalg.solve(mf.nudge_eig(Id + s), sqrty0)
     else:
         raise ValueError(f'Unknown s_def: {s_def}')
 
     return y
 
-def s2t(s: npy.ndarray) -> npy.ndarray:
+def s2t(s: np.ndarray) -> np.ndarray:
     """
     Convert scattering parameters [#]_ to scattering transfer parameters [#]_.
 
@@ -6083,7 +6697,7 @@ def s2t(s: npy.ndarray) -> npy.ndarray:
 
     Returns
     -------
-    t : npy.ndarray
+    t : np.ndarray
         scattering transfer parameters (aka wave cascading matrix)
 
     See Also
@@ -6121,11 +6735,11 @@ def s2t(s: npy.ndarray) -> npy.ndarray:
     # s-parameter networks are square matrix, so x and y are equal.
     if(x % 2 != 0):
         raise IndexError('Network does not have an even number of ports')
-    t = npy.zeros((z, y, x), dtype=complex)
+    t = np.zeros((z, y, x), dtype=complex)
     yh = int(y/2)
     xh = int(x/2)
     # S_II,I^-1
-    sinv = npy.linalg.inv(s[:, yh:y, 0:xh])
+    sinv = np.linalg.inv(s[:, yh:y, 0:xh])
     # np.linalg.inv test for singularity (matrix not invertible)
     for k in range(len(s)):
         w = sinv[k].dot(s[k, yh:y, xh:x])
@@ -6139,7 +6753,7 @@ def s2t(s: npy.ndarray) -> npy.ndarray:
         t[k, yh:y, xh:x] = sinv[k]
     return t
 
-def s2s(s: NumberLike, z0: NumberLike, s_def_new: str, s_def_old: str):
+def s2s(s: NumberLike, z0: NumberLike, s_def_new: SdefT, s_def_old: SdefT):
     r"""
     Convert scattering parameters to scattering parameters with different
     definition.
@@ -6188,63 +6802,63 @@ def s2s(s: NumberLike, z0: NumberLike, s_def_new: str, s_def_old: str):
     nfreqs, nports, nports = s.shape
     z0 = fix_z0_shape(z0, nfreqs, nports)
 
-    if npy.isreal(z0).all():
+    if np.isreal(z0).all():
         # Nothing to do because all port impedances are real so the used
         # definition (power or travelling) does not make a difference.
         return s
 
     # Calculate port voltages and currents using the old s_def.
-    F, G = npy.zeros_like(s), npy.zeros_like(s)
+    F, G = np.zeros_like(s), np.zeros_like(s)
     if s_def_old == 'power':
-        npy.einsum('ijj->ij', F)[...] = 1.0/(npy.sqrt(z0.real))
-        npy.einsum('ijj->ij', G)[...] = z0
-        Id = npy.eye(s.shape[1], dtype=complex)
+        np.einsum('ijj->ij', F)[...] = 1.0/(np.sqrt(z0.real))
+        np.einsum('ijj->ij', G)[...] = z0
+        Id = np.eye(s.shape[1], dtype=complex)
         v = F @ (G.conjugate() + G @ s)
         i = F @ (Id - s)
     elif s_def_old == 'pseudo':
-        npy.einsum('ijj->ij', F)[...] = abs(z0)/npy.sqrt(z0.real)
-        npy.einsum('ijj->ij', G)[...] = abs(z0)/(z0*npy.sqrt(z0.real))
-        Id = npy.eye(s.shape[1], dtype=complex)
+        np.einsum('ijj->ij', F)[...] = abs(z0)/np.sqrt(z0.real)
+        np.einsum('ijj->ij', G)[...] = abs(z0)/(z0*np.sqrt(z0.real))
+        Id = np.eye(s.shape[1], dtype=complex)
         v = F @ (Id + s)
         i = G @ (Id - s)
     elif s_def_old == 'traveling':
-        npy.einsum('ijj->ij', F)[...] = npy.sqrt(z0)
-        npy.einsum('ijj->ij', G)[...] = 1/(npy.sqrt(z0))
-        Id = npy.eye(s.shape[1], dtype=complex)
+        np.einsum('ijj->ij', F)[...] = np.sqrt(z0)
+        np.einsum('ijj->ij', G)[...] = 1/(np.sqrt(z0))
+        Id = np.eye(s.shape[1], dtype=complex)
         v = F @ (Id + s)
         i = G @ (Id - s)
     else:
         raise ValueError(f'Unknown s_def: {s_def_old}')
 
     # Calculate a and b waves from the voltages and currents.
-    F, G = npy.zeros_like(s), npy.zeros_like(s)
+    F, G = np.zeros_like(s), np.zeros_like(s)
     if s_def_new == 'power':
-        npy.einsum('ijj->ij', F)[...] = 1/(2*npy.sqrt(z0.real))
-        npy.einsum('ijj->ij', G)[...] = z0
+        np.einsum('ijj->ij', F)[...] = 1/(2*np.sqrt(z0.real))
+        np.einsum('ijj->ij', G)[...] = z0
         a = F @ (v + G @ i)
         b = F @ (v - G.conjugate() @ i)
     elif s_def_new == 'pseudo':
-        npy.einsum('ijj->ij', F)[...] = npy.sqrt(z0.real)/(2*abs(z0))
-        npy.einsum('ijj->ij', G)[...] = z0
+        np.einsum('ijj->ij', F)[...] = np.sqrt(z0.real)/(2*abs(z0))
+        np.einsum('ijj->ij', G)[...] = z0
         a = F @ (v + G @ i)
         b = F @ (v - G @ i)
     elif s_def_new == 'traveling':
-        npy.einsum('ijj->ij', F)[...] = 1/(npy.sqrt(z0))
-        npy.einsum('ijj->ij', G)[...] = z0
+        np.einsum('ijj->ij', F)[...] = 1/(np.sqrt(z0))
+        np.einsum('ijj->ij', G)[...] = z0
         a = F @ (v + G @ i)
         b = F @ (v - G @ i)
     else:
         raise ValueError(f'Unknown s_def: {s_def_old}')
 
     # New S-parameter matrix from a and b waves.
-    s_new = npy.zeros_like(s)
+    s_new = np.zeros_like(s)
     for n in range(nports):
         for m in range(nports):
             s_new[:, m, n] = b[:, m, n] / a[:, n, n]
 
     return s_new
 
-def z2s(z: NumberLike, z0:NumberLike = 50, s_def: str = S_DEF_DEFAULT) -> npy.ndarray:
+def z2s(z: NumberLike, z0:NumberLike = 50, s_def: SdefT = S_DEF_DEFAULT) -> np.ndarray:
     r"""
     Convert impedance parameters [#]_ to scattering parameters [#]_.
 
@@ -6303,37 +6917,37 @@ def z2s(z: NumberLike, z0:NumberLike = 50, s_def: str = S_DEF_DEFAULT) -> npy.nd
     z0 = z0.astype(dtype=complex)
     z0[z0.real == 0] += ZERO
 
-    z = npy.array(z, dtype=complex)
+    z = np.array(z, dtype=complex)
 
     if s_def == 'power':
         # Power-waves. Eq.(18) from [Kurokawa et al.3]
         # Creating diagonal matrices of shape (nports,nports) for each nfreqs
-        F, G = npy.zeros_like(z), npy.zeros_like(z)
-        npy.einsum('ijj->ij', F)[...] = 1.0/(2*npy.sqrt(z0.real))
-        npy.einsum('ijj->ij', G)[...] = z0
-        s = mf.rsolve(F @ (z + G), F @ (z - npy.conjugate(G)))
+        F, G = np.zeros_like(z), np.zeros_like(z)
+        np.einsum('ijj->ij', F)[...] = 1.0/(2*np.sqrt(z0.real))
+        np.einsum('ijj->ij', G)[...] = z0
+        s = mf.rsolve(F @ (z + G), F @ (z - np.conjugate(G)))
 
     elif s_def == 'pseudo':
         # Pseudo-waves. Eq.(73) from [Marks et al.]
         # Creating diagonal matrices of shape (nports,nports) for each nfreqs
-        ZR, U = npy.zeros_like(z), npy.zeros_like(z)
-        npy.einsum('ijj->ij', U)[...] = npy.sqrt(z0.real)/npy.abs(z0)
-        npy.einsum('ijj->ij', ZR)[...] = z0
+        ZR, U = np.zeros_like(z), np.zeros_like(z)
+        np.einsum('ijj->ij', U)[...] = np.sqrt(z0.real)/np.abs(z0)
+        np.einsum('ijj->ij', ZR)[...] = z0
         s = mf.rsolve(U @ (z + ZR), U @ (z - ZR))
 
     elif s_def == 'traveling':
         # Traveling-waves definition. Cf.Wikipedia "Impedance parameters" page.
         # Creating Identity matrices of shape (nports,nports) for each nfreqs
-        Id, sqrty0 = npy.zeros_like(z), npy.zeros_like(z) # (nfreqs, nports, nports)
-        npy.einsum('ijj->ij', Id)[...] = 1.0
-        npy.einsum('ijj->ij', sqrty0)[...] = npy.sqrt(1.0/z0)
+        Id, sqrty0 = np.zeros_like(z), np.zeros_like(z) # (nfreqs, nports, nports)
+        np.einsum('ijj->ij', Id)[...] = 1.0
+        np.einsum('ijj->ij', sqrty0)[...] = np.sqrt(1.0/z0)
         s = mf.rsolve(sqrty0 @ z @ sqrty0 + Id, sqrty0 @ z @ sqrty0 - Id)
     else:
         raise ValueError(f'Unknown s_def: {s_def}')
 
     return s
 
-def z2y(z: npy.ndarray) -> npy.ndarray:
+def z2y(z: np.ndarray) -> np.ndarray:
     """
     Convert impedance parameters [#]_ to admittance parameters [#]_.
 
@@ -6376,7 +6990,7 @@ def z2y(z: npy.ndarray) -> npy.ndarray:
     .. [#] http://en.wikipedia.org/wiki/Admittance_parameters
     """
 
-    if npy.amin(npy.linalg.matrix_rank(z)) < npy.shape(z)[1]:
+    if np.amin(np.linalg.matrix_rank(z)) < np.shape(z)[1]:
         # matrix is deficient, direct inversion not possible
         # try detour via S parameters
         warnings.warn('The Z matrix is singular. Conversion to Y parameters could be invalid. Trying s2y(z2s(z)).',
@@ -6384,9 +6998,9 @@ def z2y(z: npy.ndarray) -> npy.ndarray:
         return s2y(z2s(z))
     else:
         # matrix has full rank, direct inversion possible
-        return npy.linalg.inv(z)
+        return np.linalg.inv(z)
 
-def z2t(z: npy.ndarray) -> NoReturn:
+def z2t(z: np.ndarray) -> NoReturn:
     """
     Not Implemented yet.
 
@@ -6431,7 +7045,7 @@ def z2t(z: npy.ndarray) -> NoReturn:
     raise (NotImplementedError)
 
 
-def a2s(a: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
+def a2s(a: np.ndarray, z0: NumberLike = 50) -> np.ndarray:
     """
     Convert abcd parameters to s parameters.
 
@@ -6462,13 +7076,13 @@ def a2s(a: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
     D = a[:,1,1]
     denom = A*z02 + B + C*z01*z02 + D*z01
 
-    s = npy.array([
+    s = np.array([
         [
             (A*z02 + B - C*z01.conj()*z02 - D*z01.conj() ) / denom,
-            (2*npy.sqrt(z01.real * z02.real)) / denom,
+            (2*np.sqrt(z01.real * z02.real)) / denom,
         ],
         [
-            (2*(A*D - B*C)*npy.sqrt(z01.real * z02.real)) / denom,
+            (2*(A*D - B*C)*np.sqrt(z01.real * z02.real)) / denom,
             (-A*z02.conj() + B - C*z01*z02.conj() + D*z01) / denom,
         ],
     ]).transpose()
@@ -6478,7 +7092,7 @@ def a2s(a: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
 
 
 
-def a2z(a: npy.ndarray) -> npy.ndarray:
+def a2z(a: np.ndarray) -> np.ndarray:
     """
     Convert abcd parameters to z parameters [#]_.
 
@@ -6490,7 +7104,7 @@ def a2z(a: npy.ndarray) -> npy.ndarray:
 
     Returns
     -------
-    z : npy.ndarray
+    z : np.ndarray
         impedance parameters
 
     See Also
@@ -6522,7 +7136,7 @@ def a2z(a: npy.ndarray) -> npy.ndarray:
     return z2a(a)
 
 
-def z2a(z: npy.ndarray) -> npy.ndarray:
+def z2a(z: np.ndarray) -> np.ndarray:
     """
     Converts impedance parameters to abcd  parameters [#]_.
 
@@ -6534,7 +7148,7 @@ def z2a(z: npy.ndarray) -> npy.ndarray:
 
     Returns
     -------
-    abcd : npy.ndarray
+    abcd : np.ndarray
         scattering transfer parameters (aka wave cascading matrix)
 
     See Also
@@ -6562,7 +7176,7 @@ def z2a(z: npy.ndarray) -> npy.ndarray:
     ----------
     .. [#] https://en.wikipedia.org/wiki/Two-port_network
     """
-    abcd = npy.array([
+    abcd = np.array([
         [z[:, 0, 0] / z[:, 1, 0],
          1. / z[:, 1, 0]],
         [(z[:, 0, 0] * z[:, 1, 1] - z[:, 1, 0] * z[:, 0, 1]) / z[:, 1, 0],
@@ -6571,7 +7185,7 @@ def z2a(z: npy.ndarray) -> npy.ndarray:
     return abcd
 
 
-def s2a(s: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
+def s2a(s: np.ndarray, z0: NumberLike = 50) -> np.ndarray:
     """
     Convert scattering parameters to abcd parameters [#]_.
 
@@ -6585,7 +7199,7 @@ def s2a(s: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
 
     Returns
     -------
-    abcd : npy.ndarray
+    abcd : np.ndarray
         scattering transfer parameters (aka wave cascading matrix)
 
     References
@@ -6601,8 +7215,8 @@ def s2a(s: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
     z0 = fix_z0_shape(z0, nfreqs, nports)
     z01 = z0[:,0]
     z02 = z0[:,1]
-    denom = (2*s[:,1,0]*npy.sqrt(z01.real * z02.real))
-    a = npy.array([
+    denom = (2*s[:,1,0]*np.sqrt(z01.real * z02.real))
+    a = np.array([
         [
             ((z01.conj() + s[:,0,0]*z01)*(1 - s[:,1,1]) + s[:,0,1]*s[:,1,0]*z01) / denom,
             ((1 - s[:,0,0])*(1 - s[:,1,1]) - s[:,0,1]*s[:,1,0]) / denom,
@@ -6615,7 +7229,7 @@ def s2a(s: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
     return a
 
 
-def y2s(y: NumberLike, z0:NumberLike = 50, s_def: str = S_DEF_DEFAULT) -> Network:
+def y2s(y: NumberLike, z0:NumberLike = 50, s_def: SdefT = S_DEF_DEFAULT) -> Network:
     r"""
     Convert admittance parameters [#]_ to scattering parameters [#]_.
 
@@ -6694,26 +7308,26 @@ def y2s(y: NumberLike, z0:NumberLike = 50, s_def: str = S_DEF_DEFAULT) -> Networ
     z0 = z0.astype(dtype=complex)
     z0[z0.real == 0] += ZERO
 
-    y = npy.array(y, dtype=complex)
+    y = np.array(y, dtype=complex)
 
     # The following is a vectorized version of a for loop for all frequencies.
     # Creating Identity matrices of shape (nports,nports) for each nfreqs
-    Id = npy.zeros_like(y)  # (nfreqs, nports, nports)
-    npy.einsum('ijj->ij', Id)[...] = 1.0
+    Id = np.zeros_like(y)  # (nfreqs, nports, nports)
+    np.einsum('ijj->ij', Id)[...] = 1.0
 
     if s_def == 'power':
         # Creating diagonal matrices of shape (nports,nports) for each nfreqs
-        F, G = npy.zeros_like(y), npy.zeros_like(y)
-        npy.einsum('ijj->ij', F)[...] = 1.0/(2*npy.sqrt(z0.real))
-        npy.einsum('ijj->ij', G)[...] = z0
-        s = mf.rsolve(F @ (Id + G @ y), F @ (Id - npy.conjugate(G) @ y))
+        F, G = np.zeros_like(y), np.zeros_like(y)
+        np.einsum('ijj->ij', F)[...] = 1.0/(2*np.sqrt(z0.real))
+        np.einsum('ijj->ij', G)[...] = z0
+        s = mf.rsolve(F @ (Id + G @ y), F @ (Id - np.conjugate(G) @ y))
 
     elif s_def == 'pseudo':
         # Pseudo-waves
         # Creating diagonal matrices of shape (nports,nports) for each nfreqs
-        ZR, U = npy.zeros_like(y), npy.zeros_like(y)
-        npy.einsum('ijj->ij', U)[...] = npy.sqrt(z0.real)/npy.abs(z0)
-        npy.einsum('ijj->ij', ZR)[...] = z0
+        ZR, U = np.zeros_like(y), np.zeros_like(y)
+        np.einsum('ijj->ij', U)[...] = np.sqrt(z0.real)/np.abs(z0)
+        np.einsum('ijj->ij', ZR)[...] = z0
         # This formulation is not very good numerically
         UY = mf.rsolve(mf.nudge_eig(y, cond=1e-12), U)
         s = mf.rsolve(UY + U @ ZR, -2 * U @ ZR) + Id
@@ -6721,15 +7335,15 @@ def y2s(y: NumberLike, z0:NumberLike = 50, s_def: str = S_DEF_DEFAULT) -> Networ
     elif s_def == 'traveling':
         # Traveling-waves definition. Cf.Wikipedia "Impedance parameters" page.
         # Creating diagonal matrices of shape (nports, nports) for each nfreqs
-        sqrtz0 = npy.zeros_like(y)  # (nfreqs, nports, nports)
-        npy.einsum('ijj->ij', sqrtz0)[...] = npy.sqrt(z0)
+        sqrtz0 = np.zeros_like(y)  # (nfreqs, nports, nports)
+        np.einsum('ijj->ij', sqrtz0)[...] = np.sqrt(z0)
         s = mf.rsolve(Id + sqrtz0 @ y @ sqrtz0, Id - sqrtz0 @ y @ sqrtz0)
     else:
         raise ValueError(f'Unknown s_def: {s_def}')
 
     return s
 
-def y2z(y: npy.ndarray) -> npy.ndarray:
+def y2z(y: np.ndarray) -> np.ndarray:
     """
     Convert admittance parameters [#]_ to impedance parameters [#]_.
 
@@ -6772,7 +7386,7 @@ def y2z(y: npy.ndarray) -> npy.ndarray:
     .. [#] http://en.wikipedia.org/wiki/impedance_parameters
     """
 
-    if npy.amin(npy.linalg.matrix_rank(y)) < npy.shape(y)[1]:
+    if np.amin(np.linalg.matrix_rank(y)) < np.shape(y)[1]:
         # matrix is deficient, direct inversion not possible
         # try detour via S parameters
         warnings.warn('The Y matrix is singular. Conversion to Z parameters could be invalid. Trying s2z(y2s(y)).',
@@ -6780,10 +7394,10 @@ def y2z(y: npy.ndarray) -> npy.ndarray:
         return s2z(y2s(y))
     else:
         # matrix has full rank, direct inversion possible
-        return npy.linalg.inv(y)
+        return np.linalg.inv(y)
 
 
-def y2t(y: npy.ndarray) -> NoReturn:
+def y2t(y: np.ndarray) -> NoReturn:
     """
     Not Implemented Yet.
 
@@ -6827,7 +7441,7 @@ def y2t(y: npy.ndarray) -> NoReturn:
     raise (NotImplementedError)
 
 
-def t2s(t: npy.ndarray) -> npy.ndarray:
+def t2s(t: np.ndarray) -> np.ndarray:
     """
     Converts scattering transfer parameters [#]_ to scattering parameters [#]_.
 
@@ -6878,11 +7492,11 @@ def t2s(t: npy.ndarray) -> npy.ndarray:
     # t-parameter networks are square matrix, so x and y are equal.
     if(x % 2 != 0):
         raise IndexError('Network does not have an even number of ports')
-    s = npy.zeros((z, y, x), dtype=complex)
+    s = np.zeros((z, y, x), dtype=complex)
     yh = int(y/2)
     xh = int(x/2)
     # T_II,II^-1
-    tinv = npy.linalg.inv(t[:, yh:y, xh:x])
+    tinv = np.linalg.inv(t[:, yh:y, xh:x])
     # np.linalg.inv test for singularity (matrix not invertible)
     for k in range(len(s)):
         # S_I,I = T_I,II . T_II,II^-1
@@ -6896,7 +7510,7 @@ def t2s(t: npy.ndarray) -> npy.ndarray:
     return s
 
 
-def t2z(t: npy.ndarray) -> NoReturn:
+def t2z(t: np.ndarray) -> NoReturn:
     """
     Not Implemented Yet.
 
@@ -6940,7 +7554,7 @@ def t2z(t: npy.ndarray) -> NoReturn:
     raise (NotImplementedError)
 
 
-def t2y(t: npy.ndarray) -> NoReturn:
+def t2y(t: np.ndarray) -> NoReturn:
     """
     Not Implemented Yet.
 
@@ -6984,7 +7598,7 @@ def t2y(t: npy.ndarray) -> NoReturn:
     raise (NotImplementedError)
 
 
-def h2z(h: npy.ndarray) -> npy.ndarray:
+def h2z(h: np.ndarray) -> np.ndarray:
     """
     Convert hybrid parameters to z parameters [#]_.
 
@@ -6996,7 +7610,7 @@ def h2z(h: npy.ndarray) -> npy.ndarray:
 
     Returns
     -------
-    z : npy.ndarray
+    z : np.ndarray
         impedance parameters
 
     See Also
@@ -7028,7 +7642,7 @@ def h2z(h: npy.ndarray) -> npy.ndarray:
     return z2h(h)
 
 
-def h2s(h: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
+def h2s(h: np.ndarray, z0: NumberLike = 50) -> np.ndarray:
     """
     Convert hybrid parameters to s parameters.
 
@@ -7049,7 +7663,7 @@ def h2s(h: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
     return z2s(h2z(h), z0)
 
 
-def s2h(s: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
+def s2h(s: np.ndarray, z0: NumberLike = 50) -> np.ndarray:
     """
     Convert scattering parameters [#]_ to hybrid parameters [#]_.
 
@@ -7077,7 +7691,7 @@ def s2h(s: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
     return z2h(s2z(s, z0))
 
 
-def z2h(z: npy.ndarray) -> npy.ndarray:
+def z2h(z: np.ndarray) -> np.ndarray:
     """
     Convert impedance parameters to hybrid parameters [#]_.
 
@@ -7089,7 +7703,7 @@ def z2h(z: npy.ndarray) -> npy.ndarray:
 
     Returns
     -------
-    h : npy.ndarray
+    h : np.ndarray
         hybrid parameters
 
     See Also
@@ -7117,7 +7731,7 @@ def z2h(z: npy.ndarray) -> npy.ndarray:
     -----------
     .. [#] https://en.wikipedia.org/wiki/Two-port_network
     """
-    h = npy.array([
+    h = np.array([
         [(z[:, 0, 0] * z[:, 1, 1] - z[:, 1, 0] * z[:, 0, 1]) / z[:, 1, 1],
          -z[:, 1, 0] / z[:, 1, 1]],
         [z[:, 0, 1] / z[:, 1, 1],
@@ -7125,7 +7739,7 @@ def z2h(z: npy.ndarray) -> npy.ndarray:
     ]).transpose()
     return h
 
-def g2s(g: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
+def g2s(g: np.ndarray, z0: NumberLike = 50) -> np.ndarray:
     """
     Convert inverse hybrid parameters to s parameters.
 
@@ -7142,11 +7756,11 @@ def g2s(g: npy.ndarray, z0: NumberLike = 50) -> npy.ndarray:
         scattering parameters
 
     """
-    return h2s(npy.linalg.inv(g), z0)
+    return h2s(np.linalg.inv(g), z0)
 
 
 ## these methods are used in the secondary properties
-def passivity(s: npy.ndarray) -> npy.ndarray:
+def passivity(s: np.ndarray) -> np.ndarray:
     r"""
     Passivity metric for a multi-port network.
 
@@ -7196,12 +7810,12 @@ def passivity(s: npy.ndarray) -> npy.ndarray:
 
     pas_mat = s.copy()
     for f in range(len(s)):
-        pas_mat[f, :, :] = npy.sqrt(npy.dot(s[f, :, :].conj().T, s[f, :, :]))
+        pas_mat[f, :, :] = np.sqrt(np.dot(s[f, :, :].conj().T, s[f, :, :]))
 
     return pas_mat
 
 
-def reciprocity(s: npy.ndarray) -> npy.ndarray:
+def reciprocity(s: np.ndarray) -> np.ndarray:
     """
         Reciprocity metric for a multi-port network.
 
@@ -7238,9 +7852,9 @@ def reciprocity(s: npy.ndarray) -> npy.ndarray:
 
 ## renormalize
 def renormalize_s(
-        s: npy.ndarray, z_old: NumberLike, z_new: NumberLike,
-        s_def:str = S_DEF_DEFAULT, s_def_old: str | None = None
-        ) -> npy.ndarray:
+        s: np.ndarray, z_old: NumberLike, z_new: NumberLike,
+        s_def: SdefT = S_DEF_DEFAULT, s_def_old: SdefT | None = None
+        ) -> np.ndarray:
 
     """
     Renormalize a s-parameter matrix given old and new port impedances.
@@ -7327,7 +7941,7 @@ def renormalize_s(
 def fix_param_shape(p: NumberLike):
     """
     Attempt to broadcast p to satisfy.
-        npy.shape(p) == (nfreqs, nports, nports)
+        np.shape(p) == (nfreqs, nports, nports)
 
     Parameters
     ----------
@@ -7345,7 +7959,7 @@ def fix_param_shape(p: NumberLike):
 
     """
     # Ensure input is numpy array
-    p = npy.array(p, dtype=complex)
+    p = np.array(p, dtype=complex)
     if len(p.shape) == 0:
         # Scalar
         return p.reshape(1, 1, 1)
@@ -7361,12 +7975,12 @@ def fix_param_shape(p: NumberLike):
         raise ValueError(f'Input array has too many dimensions. Shape: {p.shape}')
     return p
 
-def fix_z0_shape(z0: NumberLike, nfreqs: int, nports: int) -> npy.ndarray:
+def fix_z0_shape(z0: NumberLike, nfreqs: int, nports: int) -> np.ndarray:
     """
     Make a port impedance of correct shape for a given network's matrix.
 
     This attempts to broadcast z0 to satisfy
-        npy.shape(z0) == (nfreqs,nports)
+        np.shape(z0) == (nfreqs,nports)
 
     Parameters
     ----------
@@ -7398,30 +8012,30 @@ def fix_z0_shape(z0: NumberLike, nfreqs: int, nports: int) -> npy.ndarray:
 
 
     """
-    if npy.shape(z0) == (nfreqs, nports):
+    if np.shape(z0) == (nfreqs, nports):
         # z0 is of correct shape. super duper.return it quick.
         return z0.copy()
 
-    elif npy.ndim(z0) == 0:
-        # z0 is a single number or npy.array without dimensions.
-        return npy.array(nfreqs * [nports * [z0]])
+    elif np.ndim(z0) == 0:
+        # z0 is a single number or np.array without dimensions.
+        return np.array(nfreqs * [nports * [z0]])
 
     elif len(z0) == nports:
         # assume z0 is a list of impedances for each port,
         # but constant with frequency
-        return npy.array(nfreqs * [z0])
+        return np.array(nfreqs * [z0])
 
     elif len(z0) == nfreqs:
         # assume z0 is a list of impedances for each frequency,
         # but constant with respect to ports
-        return npy.array(nports * [z0]).T
+        return np.array(nports * [z0]).T
 
     else:
         raise IndexError('z0 is not an acceptable shape')
 
 
 ## cascading assistance functions
-def inv(s: npy.ndarray) -> npy.ndarray:
+def inv(s: np.ndarray) -> np.ndarray:
     """
     Calculate 'inverse' s-parameter matrix, used for de-embedding.
 
@@ -7456,16 +8070,16 @@ def inv(s: npy.ndarray) -> npy.ndarray:
     """
     # this idea is from lihan
     t = s2t(s)
-    tinv = npy.linalg.inv(t)
+    tinv = np.linalg.inv(t)
     sinv = t2s(tinv)
     #for f in range(len(i)):
-    #    i[f, :, :] = npy.linalg.inv(i[f, :, :])  # could also be written as
-    #    #   npy.mat(i[f,:,:])**-1  -- Trey
+    #    i[f, :, :] = np.linalg.inv(i[f, :, :])  # could also be written as
+    #    #   np.mat(i[f,:,:])**-1  -- Trey
 
     return sinv
 
 
-def flip(a: npy.ndarray) -> npy.ndarray:
+def flip(a: np.ndarray) -> np.ndarray:
     """
     Invert the ports of a networks s-matrix, 'flipping' it over left and right.
 
@@ -7587,7 +8201,7 @@ def assert_nports_equal(ntwkA: Network, ntwkB: Network) -> bool:
 ## Other
 # don't belong here, but i needed them quickly
 # this is needed for port impedance mismatches
-def impedance_mismatch(z1: NumberLike, z2: NumberLike, s_def: str = 'traveling') -> npy.ndarray:
+def impedance_mismatch(z1: NumberLike, z2: NumberLike, s_def: SdefT = 'traveling') -> np.ndarray:
     """
     Create a two-port s-matrix for a impedance mis-match.
 
@@ -7615,21 +8229,21 @@ def impedance_mismatch(z1: NumberLike, z2: NumberLike, s_def: str = 'traveling')
     """
     from .tlineFunctions import zl_2_Gamma0
     gamma = zl_2_Gamma0(z1, z2)
-    result = npy.zeros(shape=(len(gamma), 2, 2), dtype='complex')
+    result = np.zeros(shape=(len(gamma), 2, 2), dtype='complex')
 
     if s_def == 'traveling':
         result[:, 0, 0] = gamma
         result[:, 1, 1] = -gamma
-        result[:, 1, 0] = (1 + gamma) * npy.sqrt(1.0 * z1 / z2)
-        result[:, 0, 1] = (1 - gamma) * npy.sqrt(1.0 * z2 / z1)
+        result[:, 1, 0] = (1 + gamma) * np.sqrt(1.0 * z1 / z2)
+        result[:, 0, 1] = (1 - gamma) * np.sqrt(1.0 * z2 / z1)
     elif s_def == 'pseudo':
-        n = npy.abs(z2/z1) * npy.sqrt(z1.real / z2.real)
+        n = np.abs(z2/z1) * np.sqrt(z1.real / z2.real)
         result[:, 0, 0] = gamma
         result[:, 1, 1] = -gamma
         result[:, 1, 0] = 2 * z2 / (n * (z1 + z2))
         result[:, 0, 1] = 2 * z1 * n / (z1 + z2)
     elif s_def == 'power':
-        n = npy.sqrt(z1.real / z2.real)
+        n = np.sqrt(z1.real / z2.real)
         result[:, 0, 0] = (z2 - z1.conjugate()) / (z1 + z2)
         result[:, 1, 1] = (z1 - z2.conjugate()) / (z1 + z2)
         result[:, 1, 0] = (2 * z1.real) / (n * (z1 + z2))
@@ -7640,7 +8254,7 @@ def impedance_mismatch(z1: NumberLike, z2: NumberLike, s_def: str = 'traveling')
     return result
 
 
-def two_port_reflect(ntwk1: Network, ntwk2: Network = None, name : str | None = None) -> Network:
+def two_port_reflect(ntwk1: Network, ntwk2: Network | None = None, name : str | None = None) -> Network:
     """
     Generate a two-port reflective two-port, from two one-ports.
 
@@ -7676,12 +8290,12 @@ def two_port_reflect(ntwk1: Network, ntwk2: Network = None, name : str | None = 
         ntwk2 = ntwk1
     s11 = ntwk1.s[:, 0, 0]
     s22 = ntwk2.s[:, 0, 0]
-    s21 = npy.zeros(ntwk1.frequency.npoints, dtype=complex)
-    result.s = npy.array( \
+    s21 = np.zeros(ntwk1.frequency.npoints, dtype=complex)
+    result.s = np.array( \
         [[s11, s21], \
          [s21, s22]]). \
         transpose().reshape(-1, 2, 2)
-    result.z0 = npy.hstack([ntwk1.z0, ntwk2.z0])
+    result.z0 = np.hstack([ntwk1.z0, ntwk2.z0])
 
     if name is None:
         try:
@@ -7692,7 +8306,7 @@ def two_port_reflect(ntwk1: Network, ntwk2: Network = None, name : str | None = 
         result.name = name
     return result
 
-def s2s_active(s: npy.ndarray, a:npy.ndarray) -> npy.ndarray:
+def s2s_active(s: np.ndarray, a:np.ndarray) -> np.ndarray:
     r"""
     Return active s-parameters for a defined wave excitation a.
 
@@ -7734,12 +8348,12 @@ def s2s_active(s: npy.ndarray, a:npy.ndarray) -> npy.ndarray:
     .. [#] D. Williams, IEEE Microw. Mag. 14, 38 (2013).
 
     """
-    a = npy.asarray(a, dtype=complex)
+    a = np.asarray(a, dtype=complex)
     a[a == 0] = 1e-12  # solve numerical singularity
-    s_act = npy.einsum('fmi,i,m->fm', s, a, npy.reciprocal(a))
+    s_act = np.einsum('fmi,i,m->fm', s, a, np.reciprocal(a))
     return s_act  # shape : (n_freqs, n_ports)
 
-def s2z_active(s: npy.ndarray, z0: NumberLike, a: npy.ndarray) -> npy.ndarray:
+def s2z_active(s: np.ndarray, z0: NumberLike, a: np.ndarray) -> np.ndarray:
     r"""
     Return the active Z-parameters for a defined wave excitation a.
 
@@ -7779,10 +8393,10 @@ def s2z_active(s: npy.ndarray, z0: NumberLike, a: npy.ndarray) -> npy.ndarray:
     nfreqs, nports, nports = s.shape
     z0 = fix_z0_shape(z0, nfreqs, nports)
     s_act = s2s_active(s, a)
-    z_act = npy.einsum('fp,fp,fp->fp', z0, 1 + s_act, npy.reciprocal(1 - s_act))
+    z_act = np.einsum('fp,fp,fp->fp', z0, 1 + s_act, np.reciprocal(1 - s_act))
     return z_act
 
-def s2y_active(s: npy.ndarray, z0: NumberLike, a: npy.ndarray) -> npy.ndarray:
+def s2y_active(s: np.ndarray, z0: NumberLike, a: np.ndarray) -> np.ndarray:
     r"""
     Return the active Y-parameters for a defined wave excitation a.
 
@@ -7820,10 +8434,10 @@ def s2y_active(s: npy.ndarray, z0: NumberLike, a: npy.ndarray) -> npy.ndarray:
     nfreqs, nports, nports = s.shape
     z0 = fix_z0_shape(z0, nfreqs, nports)
     s_act = s2s_active(s, a)
-    y_act = npy.einsum('fp,fp,fp->fp', npy.reciprocal(z0), 1 - s_act, npy.reciprocal(1 + s_act))
+    y_act = np.einsum('fp,fp,fp->fp', np.reciprocal(z0), 1 - s_act, np.reciprocal(1 + s_act))
     return y_act
 
-def s2vswr_active(s: npy.ndarray, a: npy.ndarray) -> npy.ndarray:
+def s2vswr_active(s: np.ndarray, a: np.ndarray) -> np.ndarray:
     r"""
     Return the active VSWR for a defined wave excitation a..
 
@@ -7856,10 +8470,10 @@ def s2vswr_active(s: npy.ndarray, a: npy.ndarray) -> npy.ndarray:
         s2y_active : active Y-parameters
     """
     s_act = s2s_active(s, a)
-    vswr_act = npy.einsum('fp,fp->fp', (1 + npy.abs(s_act)), npy.reciprocal(1 - npy.abs(s_act)))
+    vswr_act = np.einsum('fp,fp->fp', (1 + np.abs(s_act)), np.reciprocal(1 - np.abs(s_act)))
     return vswr_act
 
-def twoport_to_nport(ntwk, port1, port2, nports, **kwargs):
+def twoport_to_nport(ntwk: Network, port1: int, port2: int, nports: int, **kwargs):
     r"""
     Add ports to two-port. S-parameters of added ports are all zeros.
 
@@ -7881,7 +8495,7 @@ def twoport_to_nport(ntwk, port1, port2, nports, **kwargs):
     """
     fpoints = len(ntwk.frequency)
     nport = Network(frequency=ntwk.frequency,
-                    s=npy.zeros(shape=(fpoints, nports, nports)),
+                    s=np.zeros(shape=(fpoints, nports, nports)),
                     name=ntwk.name,
                     **kwargs)
     nport.s[:,port1,port1] = ntwk.s[:,0,0]
