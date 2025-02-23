@@ -42,7 +42,7 @@ import re
 import warnings
 from numbers import Number
 
-import numpy as npy
+import numpy as np
 from numpy import (
     geomspace,
     gradient,  # used to center attribute `t` at 0
@@ -50,7 +50,7 @@ from numpy import (
     pi,
 )
 
-from .constants import FREQ_UNITS, ZERO, NumberLike
+from .constants import FREQ_UNITS, ZERO, FrequencyUnitT, NumberLike, SweepTypeT
 from .util import Axes, axes_kwarg, find_nearest_index, slice_domain
 
 
@@ -92,7 +92,7 @@ class Frequency:
 
 
     def __init__(self, start: float = 0, stop: float = 0, npoints: int = 0,
-        unit: str = None, sweep_type: str = 'lin') -> None:
+        unit: FrequencyUnitT | None = None, sweep_type: SweepTypeT = 'lin') -> None:
         """
         Frequency initializer.
 
@@ -109,10 +109,10 @@ class Frequency:
         npoints : int, optional
             number of points in the band. Default is 0.
         unit : string, optional
-            Frequency unit of the band: 'hz', 'khz', 'mhz', 'ghz', 'thz'.
+            Frequency unit of the band: 'Hz', 'kHz', 'MHz', 'GHz', 'THz'.
             This is used to create the attribute :attr:`f_scaled`.
             It is also used by the :class:`~skrf.network.Network` class
-            for plots vs. frequency. Default is 'hz'.
+            for plots vs. frequency. Default is 'Hz'.
         sweep_type : string, optional
             Type of the sweep: 'lin' or 'log'.
             'lin' for linear and 'log' for logarithmic. Default is 'lin'.
@@ -144,13 +144,15 @@ class Frequency:
                           Frequency unit not passed: uses 'Hz' per default.
                           ''',
                           DeprecationWarning, stacklevel=2)
-            unit = 'hz'
+            unit = 'Hz'
         self._unit = unit.lower()
 
         start =  self.multiplier * start
         stop = self.multiplier * stop
 
-        if sweep_type.lower() == 'lin':
+        if npoints == 0:
+            self._f = np.array([])
+        elif sweep_type.lower() == 'lin':
             self._f = linspace(start, stop, npoints)
         elif sweep_type.lower() == 'log' and start > 0:
             self._f = geomspace(start, stop, npoints)
@@ -222,22 +224,22 @@ class Frequency:
             else:
                 raise ValueError()
             try:
-                output._f = npy.array(output.f[slicer]).reshape(-1)
+                output._f = np.array(output.f[slicer]).reshape(-1)
                 return output
             except(IndexError) as err:
                 raise IndexError('slicing frequency is incorrect') from err
 
 
         if output.f.shape[0] > 0:
-            output._f = npy.array(output.f[key]).reshape(-1)
+            output._f = np.array(output.f[key]).reshape(-1)
         else:
-            output._f = npy.empty(shape=(0))
+            output._f = np.empty(shape=(0))
 
         return output
 
 
     @classmethod
-    def from_f(cls, f: NumberLike, *args,**kwargs) -> Frequency:
+    def from_f(cls, f: NumberLike, unit: FrequencyUnitT | None = None) -> Frequency:
         """
         Construct Frequency object from a frequency vector.
 
@@ -263,13 +265,13 @@ class Frequency:
 
         Examples
         --------
-        >>> f = npy.linspace(75,100,101)
-        >>> rf.Frequency.from_f(f, unit='ghz')
+        >>> f = np.linspace(75,100,101)
+        >>> rf.Frequency.from_f(f, unit='GHz')
         """
-        if npy.isscalar(f):
+        if np.isscalar(f):
             f = [f]
-        temp_freq =  cls(0,0,0,*args, **kwargs)
-        temp_freq._f = npy.asarray(f) * temp_freq.multiplier
+        temp_freq =  cls(0,0,0,unit=unit)
+        temp_freq._f = np.asarray(f) * temp_freq.multiplier
         temp_freq.check_monotonic_increasing()
 
         return temp_freq
@@ -295,19 +297,44 @@ class Frequency:
         """
         return self.npoints
 
-    def __mul__(self,other: Frequency) -> Frequency:
+    def __add__(self, other: Frequency | NumberLike) -> Frequency:
         out = self.copy()
-        out.f = self.f*other
+        out._f = self.f + (other.f if isinstance(other, Frequency) else other)
         return out
 
-    def __rmul__(self,other: Frequency) -> Frequency:
+    def __sub__(self, other: Frequency | NumberLike) -> Frequency:
         out = self.copy()
-        out.f = self.f*other
+        out._f = self.f - (other.f if isinstance(other, Frequency) else other)
         return out
 
-    def __div__(self,other: Frequency) -> Frequency:
+    def __mul__(self, other: Frequency | NumberLike) -> Frequency:
         out = self.copy()
-        out.f = self.f/other
+        out._f = self.f * (other.f if isinstance(other, Frequency) else other)
+        return out
+
+    def __rmul__(self, other: Frequency | NumberLike) -> Frequency:
+        out = self.copy()
+        out._f = self.f * (other.f if isinstance(other, Frequency) else other)
+        return out
+
+    def __div__(self, other: Frequency | NumberLike) -> Frequency:
+        out = self.copy()
+        out._f = self.f / (other.f if isinstance(other, Frequency) else other)
+        return out
+
+    def __truediv__(self, other: Frequency | NumberLike) -> Frequency:
+        out = self.copy()
+        out._f = self.f / (other.f if isinstance(other, Frequency) else other)
+        return out
+
+    def __floordiv__(self, other: Frequency | NumberLike) -> Frequency:
+        out = self.copy()
+        out._f = self.f // (other.f if isinstance(other, Frequency) else other)
+        return out
+
+    def __mod__(self, other: Frequency | NumberLike) -> Frequency:
+        out = self.copy()
+        out._f = self.f % (other.f if isinstance(other, Frequency) else other)
         return out
 
     def check_monotonic_increasing(self) -> None:
@@ -318,7 +345,7 @@ class Frequency:
         InvalidFrequencyWarning:
             If frequency points are not monotonously increasing
         """
-        increase = npy.diff(self.f) > 0
+        increase = np.diff(self.f) > 0
         if not increase.all():
             warnings.warn("Frequency values are not monotonously increasing!\n"
             "To get rid of the invalid values call `drop_non_monotonic_increasing`",
@@ -330,9 +357,9 @@ class Frequency:
         Returns:
             list[int]: The dropped indices
         """
-        invalid = npy.diff(self.f, prepend=self.f[0]-1) <= 0
+        invalid = np.diff(self.f, prepend=self.f[0]-1) <= 0
         self._f = self._f[~invalid]
-        return list(npy.flatnonzero(invalid))
+        return list(np.flatnonzero(invalid))
 
     @property
     def start(self) -> float:
@@ -409,7 +436,10 @@ class Frequency:
         --------
         df : for general case
         """
-        return self.span/(self.npoints-1.)
+        if self.span == 0:
+            return 0.
+        else:
+            return self.span / (self.npoints - 1.)
 
     @property
     def step_scaled(self) -> float:
@@ -421,7 +451,10 @@ class Frequency:
         --------
         df : for general case
         """
-        return self.span_scaled/(self.npoints-1.)
+        if self.span_scaled == 0:
+            return 0.
+        else:
+            return self.span_scaled / (self.npoints - 1.)
 
     @property
     def span(self) -> float:
@@ -438,7 +471,7 @@ class Frequency:
         return abs(self.stop_scaled-self.start_scaled)
 
     @property
-    def f(self) -> npy.ndarray:
+    def f(self) -> np.ndarray:
         """
         Frequency vector in Hz.
 
@@ -457,7 +490,7 @@ class Frequency:
 
 
     @property
-    def f_scaled(self) -> npy.ndarray:
+    def f_scaled(self) -> np.ndarray:
         """
         Frequency vector in units of :attr:`unit`.
 
@@ -474,7 +507,7 @@ class Frequency:
         return self.f/self.multiplier
 
     @property
-    def w(self) -> npy.ndarray:
+    def w(self) -> np.ndarray:
         r"""
         Angular frequency in radians/s.
 
@@ -497,7 +530,7 @@ class Frequency:
         return 2*pi*self.f
 
     @property
-    def df(self) -> npy.ndarray:
+    def df(self) -> np.ndarray:
         """
         The gradient of the frequency vector.
 
@@ -511,7 +544,7 @@ class Frequency:
         return gradient(self.f)
 
     @property
-    def df_scaled(self) -> npy.ndarray:
+    def df_scaled(self) -> np.ndarray:
         """
         The gradient of the frequency vector (in unit of :attr:`unit`).
 
@@ -524,7 +557,7 @@ class Frequency:
         return gradient(self.f_scaled)
 
     @property
-    def dw(self) -> npy.ndarray:
+    def dw(self) -> np.ndarray:
         """
         The gradient of the frequency vector (in radians).
 
@@ -537,7 +570,7 @@ class Frequency:
         return gradient(self.w)
 
     @property
-    def unit(self) -> str:
+    def unit(self) -> FrequencyUnitT:
         """
         Unit of this frequency band.
 
@@ -554,7 +587,7 @@ class Frequency:
         return self.unit_dict[self._unit]
 
     @unit.setter
-    def unit(self, unit: str) -> None:
+    def unit(self, unit: FrequencyUnitT) -> None:
         self._unit = unit.lower()
 
     @property
@@ -576,21 +609,41 @@ class Frequency:
         """
         Returns a new copy of this frequency.
         """
-        freq =  Frequency.from_f(self.f, unit='hz')
+        freq =  Frequency.from_f(self.f, unit='Hz')
         freq.unit = self.unit
         return freq
 
+    def _t_padded(self, *, pad: int = 0, n: int | None = None, bandpass: bool | None = None) -> np.ndarray:
+        if bandpass is None:
+            bandpass = self.f[0] != 0
+
+        if n is None:
+            n = self.npoints + pad
+            n = n if bandpass else n * 2 - 1
+
+        if bandpass:
+            dt = 1 / (n * self.step)
+            t_stop = (n - 1) // 2 * dt
+            t_start = -t_stop - dt if n % 2 == 0 else (-n // 2 + 1) * dt
+
+            t = np.linspace(t_start, t_stop, num=n, endpoint=True)
+        else:
+            dt = 1 / (n * self.step)
+            t = np.linspace(-dt * (n // 2), dt * (n // 2), num=n, endpoint=True)
+
+        return t
+
     @property
-    def t(self) -> npy.ndarray:
+    def t(self) -> np.ndarray:
         """
         Time vector in s.
 
         t_period = 2*(n-1)/f_step
         """
-        return npy.fft.fftshift(npy.fft.fftfreq(self.npoints, self.step))
+        return self._t_padded(bandpass=True)
 
     @property
-    def t_ns(self) -> npy.ndarray:
+    def t_ns(self) -> np.ndarray:
         """
         Time vector in ns.
 
@@ -598,7 +651,7 @@ class Frequency:
         """
         return self.t*1e9
 
-    def round_to(self, val: str | Number = 'hz') -> None:
+    def round_to(self, val: FrequencyUnitT | Number = 'Hz') -> None:
         """
         Round off frequency values to a specified precision.
 
@@ -609,19 +662,19 @@ class Frequency:
         ----------
         val : string or number
             if val is a string it should be a frequency :attr:`unit`
-            (ie 'hz', 'mhz',etc). if its a number, then this returns
+            (ie 'Hz', 'MHz',etc). if its a number, then this returns
             f = f-f%val
 
         Examples
         --------
-        >>> f = skrf.Frequency.from_f([.1,1.2,3.5],unit='hz')
-        >>> f.round_to('hz')
+        >>> f = skrf.Frequency.from_f([.1,1.2,3.5],unit='Hz')
+        >>> f.round_to('Hz')
 
         """
         if isinstance(val, str):
             val = self.multiplier_dict[val.lower()]
 
-        self.f = npy.round(self.f/val)*val
+        self.f = np.round(self.f/val)*val
 
     def overlap(self,f2: Frequency) -> Frequency:
         """
@@ -645,9 +698,9 @@ class Frequency:
             'lin' if linearly increasing, 'log' or 'unknown'.
 
         """
-        if npy.allclose(self.f, linspace(self.f[0], self.f[-1], self.npoints), rtol=0.05):
+        if np.allclose(self.f, linspace(self.f[0], self.f[-1], self.npoints), rtol=0.05):
             sweep_type = 'lin'
-        elif self.f[0] and npy.allclose(self.f, geomspace(self.f[0], self.f[-1], self.npoints), rtol=0.05):
+        elif self.f[0] and np.allclose(self.f, geomspace(self.f[0], self.f[-1], self.npoints), rtol=0.05):
             sweep_type = 'log'
         else:
             sweep_type = 'unknown'
@@ -669,7 +722,7 @@ class Frequency:
                 returned by :func:`matplotlib.gca()`
         """
 
-        ax.set_xlabel('Frequency (%s)' % self.unit)
+        ax.set_xlabel(f'Frequency ({self.unit})')
 
     @axes_kwarg
     def plot(self, y: NumberLike, *args, ax: Axes=None, **kwargs):
@@ -683,13 +736,13 @@ class Frequency:
         from .plotting import scale_frequency_ticks
 
         try:
-            if len(npy.shape(y)) > 2:
+            if len(np.shape(y)) > 2:
                 # perhaps the dimensions are empty, try to squeeze it down
                 y = y.squeeze()
-                if len(npy.shape(y)) > 2:
+                if len(np.shape(y)) > 2:
                     # the dimensions are full, so lets loop and plot each
-                    for m in range(npy.shape(y)[1]):
-                        for n in range(npy.shape(y)[2]):
+                    for m in range(np.shape(y)[1]):
+                        for n in range(np.shape(y)[2]):
                             self.plot(y[:, m, n], *args, **kwargs)
                     return
             if len(y) == len(self):
@@ -699,7 +752,7 @@ class Frequency:
                 raise IndexError(['thing to plot doesn\'t have same'
                                 ' number of points as f'])
         except(TypeError):
-            y = y * npy.ones(len(self))
+            y = y * np.ones(len(self))
 
         # plt.plot(self.f_scaled, y, *args, **kwargs)
         ax.plot(self.f, y, *args, **kwargs)
@@ -742,6 +795,6 @@ def overlap_freq(f1: Frequency,f2: Frequency) -> Frequency:
     start = max(f1.start, f2.start)
     stop = min(f1.stop, f2.stop)
     f = f1.f[(f1.f>=start) & (f1.f<=stop)]
-    freq =  Frequency.from_f(f, unit = 'hz')
+    freq =  Frequency.from_f(f, unit = 'Hz')
     freq.unit = f1.unit
     return freq

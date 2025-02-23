@@ -72,10 +72,11 @@ import pickle
 import sys
 import warnings
 from io import StringIO
+from pathlib import Path
 from pickle import UnpicklingError
 from typing import Any
 
-import numpy as npy
+import numpy as np
 from pandas import DataFrame, ExcelWriter, Series
 
 from ..frequency import Frequency
@@ -113,7 +114,7 @@ def read(file, *args, **kwargs):
 
     Parameters
     ----------
-    file : str or file-object
+    file : str, Path, or file-object
         name of file, or  a file-object
     \*args, \*\*kwargs : arguments and keyword arguments
         passed through to pickle.load
@@ -174,7 +175,7 @@ def write(file, obj, overwrite = True):
 
     Parameters
     ----------
-    file : file or string
+    file : file, Path, or string
         File or filename to which the data is saved.  If file is a
         file-object, then the filename is unchanged.  If file is a
         string, an appropriate extension will be appended to the file
@@ -252,7 +253,7 @@ def write(file, obj, overwrite = True):
         pickle.dump(obj, fid, protocol=2)
         fid.close()
 
-def read_all(dir: str ='.', sort = True, contains = None, f_unit = None,
+def read_all(dir: str | Path = '.', sort = True, contains = None, f_unit = None,
         obj_type=None, files: list=None, recursive=False) -> dict:
     """
     Read all skrf objects in a directory.
@@ -263,7 +264,7 @@ def read_all(dir: str ='.', sort = True, contains = None, f_unit = None,
 
     Parameters
     ----------
-    dir : str, optional
+    dir : str or Path, optional
         the directory to load from, default  \'.\'
     sort: boolean, default is True
         filenames sorted by https://docs.python.org/3/library/stdtypes.html#list.sort without arguements
@@ -311,6 +312,9 @@ def read_all(dir: str ='.', sort = True, contains = None, f_unit = None,
     read_all : read all skrf objects in a directory
     write_all : write dictionary of skrf objects to a directory
     """
+
+    # Convert a Path object to a string
+    dir = str(dir.resolve()) if isinstance(dir, Path) else dir
 
     out={}
 
@@ -417,7 +421,7 @@ def write_all(dict_objs, dir='.', *args, **kwargs):
 
     """
     if not os.path.exists('.'):
-        raise OSError('No such directory: %s'%dir)
+        raise OSError(f'No such directory: {dir}')
 
 
 
@@ -581,15 +585,15 @@ def read_csv(filename):
 
     ntwk = Network(name=filename[:-4])
     try:
-        data = npy.loadtxt(filename, skiprows=3,delimiter=',',\
+        data = np.loadtxt(filename, skiprows=3,delimiter=',',\
                 usecols=range(9))
         s11 = data[:,1] +1j*data[:,2]
         s21 = data[:,3] +1j*data[:,4]
         s12 = data[:,5] +1j*data[:,6]
         s22 = data[:,7] +1j*data[:,8]
-        ntwk.s = npy.array([[s11, s21],[s12,s22]]).transpose().reshape(-1,2,2)
+        ntwk.s = np.array([[s11, s21],[s12,s22]]).transpose().reshape(-1,2,2)
     except(IndexError):
-        data = npy.loadtxt(filename, skiprows=3,delimiter=',',\
+        data = np.loadtxt(filename, skiprows=3,delimiter=',',\
                 usecols=range(3))
         ntwk.s = data[:,1] +1j*data[:,2]
 
@@ -623,14 +627,14 @@ def statistical_2_touchstone(file_name, new_file_name=None,\
 
     # This breaks compatibility with python 2.6 and older
     with open(file_name) as old_file, open(new_file_name, 'w') as new_file:
-        new_file.write('%s\n'%header_string)
+        new_file.write(f'{header_string}\n')
         for line in old_file:
             new_file.write(line)
 
     if remove_tmp_file:
         os.rename(new_file_name,file_name)
 
-def network_2_spreadsheet(ntwk: Network, file_name: str = None,
+def network_2_spreadsheet(ntwk: Network, file_name: str | Path = None,
         file_type: str = 'excel', form: str ='db', *args, **kwargs):
     r"""
     Write a Network object to a spreadsheet, for your boss.
@@ -651,7 +655,7 @@ def network_2_spreadsheet(ntwk: Network, file_name: str = None,
     ----------
     ntwk :  :class:`~skrf.network.Network` object
         the network to write
-    file_name : str, None
+    file_name : str, Path or None
         the file_name to write. if None,  ntwk.name is used.
     file_type : ['csv','excel','html']
         the type of file to write. See `pandas.DataFrame.to_???` functions.
@@ -686,7 +690,7 @@ def network_2_spreadsheet(ntwk: Network, file_name: str = None,
         file_name = ntwk.name + '.'+file_extns[file_type]
 
     d = {}
-    index =ntwk.frequency.f
+    index = ntwk.frequency.f_scaled
 
     if form =='db':
         for m,n in ntwk.port_tuples:
@@ -708,8 +712,8 @@ def network_2_spreadsheet(ntwk: Network, file_name: str = None,
                 Series(ntwk.s_im[:,m,n], index = index)
 
     df = DataFrame(d)
-    df.__getattribute__('to_%s'%file_type)(file_name,
-        index_label='Freq(%s)'%ntwk.frequency.unit, **kwargs)
+    df.__getattribute__(f'to_{file_type}')(file_name,
+        index_label=f'Freq({ntwk.frequency.unit})', **kwargs)
 
 def network_2_dataframe(ntwk: Network, attrs: list[str] =None,
         ports: list[tuple[int, int]] = None, port_sep: str | None = None):
@@ -814,10 +818,10 @@ class TouchstoneEncoder(json.JSONEncoder):
     and breaking down frequency objects into dicts.
     """
     def default(self, obj):
-        if isinstance(obj, npy.ndarray):
+        if isinstance(obj, np.ndarray):
             return obj.tolist()
         if isinstance(obj, complex):
-            return npy.real(obj), npy.imag(obj)  # split into [real, im]
+            return np.real(obj), np.imag(obj)  # split into [real, im]
         if isinstance(obj, Frequency):
             return {'flist': obj.f_scaled.tolist(), 'funit': obj.unit}
         return json.JSONEncoder.default(self, obj)
@@ -849,8 +853,8 @@ def from_json_string(obj_string):
     ntwk.name = obj['name']
     ntwk.comments = obj['comments']
     ntwk.port_names = obj['port_names']
-    ntwk.z0 = npy.array(obj['_z0'])[..., 0] + npy.array(obj['_z0'])[..., 1] * 1j  # recreate complex numbers
-    ntwk.s = npy.array(obj['_s'])[..., 0] + npy.array(obj['_s'])[..., 1] * 1j
-    ntwk.frequency = Frequency.from_f(npy.array(obj['_frequency']['flist']),
+    ntwk.z0 = np.array(obj['_z0'])[..., 0] + np.array(obj['_z0'])[..., 1] * 1j  # recreate complex numbers
+    ntwk.s = np.array(obj['_s'])[..., 0] + np.array(obj['_s'])[..., 1] * 1j
+    ntwk.frequency = Frequency.from_f(np.array(obj['_frequency']['flist']),
                                          unit=obj['_frequency']['funit'])
     return ntwk
