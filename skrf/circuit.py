@@ -599,6 +599,14 @@ class Circuit:
         """
         Return a 2-port network of a shunt admittance.
 
+        The network topology is::
+
+            (Port 1)-----(Port 2)
+                      |
+                     [Y]
+                      |
+                     Gnd
+
         Passing the frequency and name is mandatory.
 
         Parameters
