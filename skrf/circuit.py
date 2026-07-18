@@ -520,6 +520,10 @@ class Circuit:
         """
         Return a 1-port Network to be used as a Circuit port.
 
+        The network topology is::
+
+            (Port)
+
         Parameters
         ----------
         frequency : :class:`~skrf.frequency.Frequency`
@@ -555,6 +559,10 @@ class Circuit:
     def SeriesImpedance(cls, frequency: Frequency, Z: NumberLike, name: str, z0: float = 50) -> Network:
         """
         Return a 2-port network of a series impedance.
+
+        The network topology is::
+
+            (Port 1)-----[Z]-----(Port 2)
 
         Passing the frequency and name is mandatory.
 
@@ -599,6 +607,14 @@ class Circuit:
         """
         Return a 2-port network of a shunt admittance.
 
+        The network topology is::
+
+            (Port 1)-----(Port 2)
+                      |
+                     [Y]
+                      |
+                     Gnd
+
         Passing the frequency and name is mandatory.
 
         Parameters
@@ -642,6 +658,10 @@ class Circuit:
         """
         Return a 1-port network of a grounded link.
 
+        The network topology is::
+
+            (Port)-----Gnd
+
         Passing the frequency and a name is mandatory.
 
         The ground link is implemented by media.short object.
@@ -681,6 +701,10 @@ class Circuit:
     def Open(cls, frequency: Frequency, name: str, z0: float = 50) -> Network:
         """
         Return a 1-port network of an open link.
+
+        The network topology is::
+
+            (Port)-----Open
 
         Passing the frequency and name is mandatory.
 
